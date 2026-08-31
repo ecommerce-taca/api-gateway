@@ -1,0 +1,92 @@
+# Môi trường local cho API Gateway. KHÔNG dùng làm cấu hình production.
+#
+# Điều kiện chạy: `make up` ở thư mục gốc — nó render kong.yaml sang
+# kong/deck/.build/kong.dev.yaml và sinh khoá dev cho JWKS mock trước khi gọi compose.
+# Chạy `docker compose up` trực tiếp khi chưa render sẽ thiếu file config.
+#
+# Hai node Kong là cố ý: rate limit phân tán và trạng thái healthcheck per-node chỉ lộ ra
+# khi có từ hai node trở lên (test doc §1.1).
+
+name: taca-api-gateway
+
+services:
+  redis:
+    image: redis:7.4.2-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [gateway]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis-data:/data
+
+  # Một container đóng vai cả 10 domain service, JWKS của auth-user và OTEL collector.
+  # Alias mạng làm mọi tên host trong kong.yaml phân giải về đây.
+  mock-upstreams:
+    image: nginx:1.27.3-alpine
+    volumes:
+      - ./mocks/nginx/upstream-mock.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./mocks/jwks:/mock/jwks:ro
+    networks:
+      gateway:
+        aliases:
+          - mock-auth-user
+          - mock-product-catalog
+          - mock-search
+          - mock-order-commerce
+          - mock-inventory
+          - mock-payment-wallet
+          - mock-shipment
+          - mock-rating-comment
+          - mock-notification
+          - mock-message
+          - mock-otel-collector
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  kong-node-1:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-upstreams:
+        condition: service_healthy
+    volumes:
+      - ./kong/deck/.build/kong.dev.yaml:/kong/declarative/kong.yaml:ro
+    networks: [gateway]
+    ports:
+      - "127.0.0.1:8000:8000"
+      # Status listener chỉ bind loopback của host: nó là endpoint vận hành, không phải
+      # public API. Admin API :8001 không được publish ở bất kỳ môi trường nào (SEC-GW-14).
+      - "127.0.0.1:8100:8100"
+
+  kong-node-2:
+    build:
+      context: .
+      target: runtime
+    depends_on:
+      redis:
+        condition: service_healthy
+      mock-upstreams:
+        condition: service_healthy
+    volumes:
+      - ./kong/deck/.build/kong.dev.yaml:/kong/declarative/kong.yaml:ro
+    networks: [gateway]
+    ports:
+      - "127.0.0.1:8010:8000"
+      - "127.0.0.1:8110:8100"
+
+networks:
+  gateway:
+    name: taca-gateway
+
+volumes:
+  redis-data:
+    name: taca-gateway-redis-data
