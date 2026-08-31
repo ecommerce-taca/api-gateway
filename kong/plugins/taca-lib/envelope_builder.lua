@@ -11,15 +11,26 @@ local JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 local _M = {}
 
 -- trace_id lấy từ X-Request-ID do plugin correlation-id sinh ở đầu chuỗi access.
--- Nếu chưa có (lỗi xảy ra trước correlation-id) thì để rỗng còn hơn bịa giá trị mới
--- không khớp với id đã ghi trong log.
+-- Khi không có route nào khớp, chuỗi access không chạy nên không có header nào cả;
+-- lúc đó dùng request id của chính Kong — cùng giá trị Kong ghi vào error log, nên
+-- vẫn tra ngược được. Contract yêu cầu mọi response lỗi đều có trace_id (API §1.2).
 function _M.resolve_trace_id()
   local ctx_trace_id = kong.ctx.shared.taca_trace_id
   if ctx_trace_id then
     return ctx_trace_id
   end
 
-  return kong.request.get_header(REQUEST_ID_HEADER) or ""
+  local client_value = kong.request.get_header(REQUEST_ID_HEADER)
+  if client_value then
+    return client_value
+  end
+
+  local loaded, request_id = pcall(require, "kong.observability.tracing.request_id")
+  if loaded then
+    return request_id.get() or ""
+  end
+
+  return ""
 end
 
 function _M.build(code, details, trace_id)

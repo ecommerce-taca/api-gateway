@@ -42,7 +42,21 @@ describe("envelope_builder", function()
     assert.equal("from-context", body.error.trace_id)
   end)
 
-  it("should return an empty trace id when no request id exists yet", function()
+  it("should fall back to the kong request id when no route matched", function()
+    kong_stub.install({})
+    package.loaded["kong.observability.tracing.request_id"] = {
+      get = function()
+        return "kong-generated-id"
+      end,
+    }
+
+    local body = envelope_builder.build("GATEWAY_INTERNAL_ERROR")
+    package.loaded["kong.observability.tracing.request_id"] = nil
+
+    assert.equal("kong-generated-id", body.error.trace_id)
+  end)
+
+  it("should return an empty trace id when even kong has no request id", function()
     kong_stub.install({})
 
     local body = envelope_builder.build("GATEWAY_INTERNAL_ERROR")

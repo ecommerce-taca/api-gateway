@@ -31,7 +31,19 @@ function _M.read_upstream_health()
     return nil
   end
 
-  local upstreams = balancer.get_all_upstreams()
+  -- get_all_upstreams đã chuyển sang module con từ sau Kong 2.5; plugin prometheus của
+  -- Kong cũng phải fallback đúng như vậy.
+  local list_upstreams = balancer.get_all_upstreams
+  if not list_upstreams then
+    local submodule_loaded, upstreams_module = pcall(require, "kong.runloop.balancer.upstreams")
+    if not submodule_loaded then
+      return nil
+    end
+
+    list_upstreams = upstreams_module.get_all_upstreams
+  end
+
+  local upstreams = list_upstreams and list_upstreams()
   if not upstreams then
     return nil
   end
