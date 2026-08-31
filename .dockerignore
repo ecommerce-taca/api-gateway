@@ -1,0 +1,11 @@
+.git
+.github
+.gitignore
+.agent
+.claude
+docs
+spec
+tools
+mocks
+docker-compose.yml
+*.md
