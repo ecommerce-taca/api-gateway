@@ -1,0 +1,10 @@
+# IT-KONG-06 — Service *-write có retries khác 0 phải làm CI fail.
+_format_version: "3.0"
+services:
+  - name: svc-order-commerce-write
+    host: up-order-commerce
+    retries: 5
+    routes:
+      - name: rt-order-commerce-buyer-write
+        paths: ["/api/v1/orders"]
+        strip_path: false

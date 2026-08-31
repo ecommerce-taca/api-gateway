@@ -1,0 +1,10 @@
+# IT-KONG-08 — Route catch-all phải làm CI fail.
+_format_version: "3.0"
+services:
+  - name: svc-everything-read
+    host: up-auth-user
+    retries: 1
+    routes:
+      - name: rt-catch-all
+        paths: ["/api/v1"]
+        strip_path: false

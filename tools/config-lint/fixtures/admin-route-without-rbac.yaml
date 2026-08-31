@@ -1,0 +1,14 @@
+# IT-KONG-07 — Route /admin/** thiếu taca-rbac phải làm CI fail.
+_format_version: "3.0"
+services:
+  - name: svc-payment-wallet-read
+    host: up-payment-wallet
+    retries: 1
+    routes:
+      - name: rt-payment-wallet-admin-read
+        paths: ["/api/v1/admin/settlements"]
+        strip_path: false
+        plugins:
+          - name: taca-jwt
+            config:
+              issuer: https://auth-user.internal

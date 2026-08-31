@@ -7,6 +7,8 @@ DECK_IMAGE ?= kong/deck:v1.65.3
 # Admin API chỉ bind loopback (kong.conf). diff/sync phải chạy từ máy có đường tới nó,
 # ví dụ qua `kubectl port-forward`; không mở Admin API ra ingress (SEC-GW-14).
 KONG_ADDR ?= http://127.0.0.1:8001
+LINT_IMAGE ?= taca-config-lint:local
+REPO_ROOT := $(abspath $(CURDIR)/../..)
 
 ENV_FILE := env/$(ENV).yaml
 BUILD_DIR := .build
@@ -35,7 +37,8 @@ validate: $(ENV_VARS)
 # Các quy tắc mà deck validate không biết: retries của Service write, taca-rbac trên
 # nhánh admin, route catch-all, fault_tolerant, hai danh sách origin... (test doc §4.2).
 lint: $(RENDERED)
-	python3 ../../tools/config-lint/kong_config_linter.py $(RENDERED)
+	docker build -q -t $(LINT_IMAGE) ../../tools/config-lint > /dev/null
+	docker run --rm -v $(REPO_ROOT):/work $(LINT_IMAGE) /work/kong/deck/$(RENDERED)
 
 diff: $(ENV_VARS)
 	$(DECK_RUN) gateway diff --kong-addr $(KONG_ADDR) kong.yaml

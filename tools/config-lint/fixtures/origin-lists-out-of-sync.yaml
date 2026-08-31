@@ -1,0 +1,10 @@
+# IT-KONG-15 — cors.origins và taca-request-guard.allowed_origins lệch nhau phải làm CI fail.
+_format_version: "3.0"
+plugins:
+  - name: cors
+    config:
+      origins: ["https://buyer.example", "https://seller.example"]
+  - name: taca-request-guard
+    config:
+      mode: proxy
+      allowed_origins: ["https://buyer.example"]
