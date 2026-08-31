@@ -1,0 +1,140 @@
+# Pipeline của API Gateway.
+# Thứ tự đặt theo giá cả: hai job rẻ và nhanh (lint cấu hình, unit test plugin) chạy song
+# song và chặn sớm; job dựng cả stack chỉ chạy khi hai job kia đã xanh.
+#
+# Không có bước deploy: sync cấu hình lên môi trường thật là hành động có chủ đích của
+# DevOps (`make -C kong/deck sync`), không phải hệ quả của một lần push.
+
+name: ci
+
+on:
+  push:
+    branches: [main, develop, test]
+  pull_request:
+    branches: [main, develop, test]
+
+jobs:
+  config-lint:
+    name: Lint declarative config
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      # Render trước khi lint: hai danh sách origin chỉ so được sau khi thay biến môi trường.
+      - name: Render config for every environment
+        run: |
+          for environment in dev staging prod; do
+            make -C kong/deck render ENV=$environment
+          done
+
+      - name: Validate config against the decK schema
+        run: make -C kong/deck validate ENV=dev
+
+      - name: Run the twelve config rules
+        run: make -C kong/deck lint ENV=dev
+
+      # Quy tắc lint viết hỏng sẽ im lặng cho mọi config đi qua, nên chính linter cũng
+      # phải có test, chạy trên fixture config sai (IT-KONG-06/07/08/15).
+      - name: Test the linter itself
+        run: |
+          docker build -q -t taca-config-lint:ci tools/config-lint
+          docker run --rm -v "$PWD":/work -w /work/tools/config-lint \
+            --entrypoint python3 taca-config-lint:ci -m unittest discover -p "test_*.py"
+
+  plugin-test:
+    name: Unit test custom plugins
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Build the test image
+        run: docker build --target test -t taca-gateway-test:ci .
+
+      - name: Run busted
+        run: docker run --rm taca-gateway-test:ci
+
+  runtime-image:
+    name: Build runtime image
+    runs-on: ubuntu-24.04
+    needs: [config-lint, plugin-test]
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      # Chỉ build, không push: chưa có registry được chốt. Image cuối không được chứa
+      # toolchain của stage test.
+      - name: Build
+        run: docker build --target runtime -t taca-gateway:${{ github.sha }} .
+
+      - name: Fail if the runtime image carries test tooling
+        run: |
+          if docker run --rm --entrypoint sh taca-gateway:${{ github.sha }} \
+              -c 'test -e /usr/local/bin/busted'; then
+            echo "runtime image contains busted — stage test đã rò sang stage runtime"
+            exit 1
+          fi
+
+  stack-smoke:
+    name: Smoke test the running stack
+    runs-on: ubuntu-24.04
+    needs: [config-lint, plugin-test]
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Start the gateway with mocked upstreams
+        run: make up
+
+      - name: Wait for both nodes to answer
+        run: |
+          for port in 8000 8010; do
+            for attempt in $(seq 1 30); do
+              if curl -sf "http://127.0.0.1:$port/health/live" > /dev/null; then break; fi
+              if [ "$attempt" = "30" ]; then echo "node on $port never became live"; exit 1; fi
+              sleep 2
+            done
+          done
+
+      # Sáu bất biến của contract mà một lỗi cấu hình sẽ phá ngay lập tức.
+      # Không thay thế bộ integration test đầy đủ ở test doc §3.
+      - name: Assert the gateway contract
+        run: |
+          set -e
+          assert_code() {
+            actual=$(curl -s -o /dev/null -w '%{http_code}' "${@:2}")
+            [ "$actual" = "$1" ] || { echo "expected $1, got $actual for: ${*:2}"; exit 1; }
+          }
+          assert_body() {
+            body=$(curl -s "${@:2}")
+            echo "$body" | grep -q "$1" || { echo "expected '$1' in: $body"; exit 1; }
+          }
+
+          assert_body '"status":"UP"' http://127.0.0.1:8000/health/live
+          assert_body '"checks"' http://127.0.0.1:8000/health/ready
+          assert_body 'GATEWAY_ROUTE_NOT_FOUND' http://127.0.0.1:8000/api/v1/nope
+          assert_body 'GATEWAY_AUTH_REQUIRED' http://127.0.0.1:8000/api/v1/users/me
+          assert_body 'GATEWAY_CORS_DENIED' -H 'Origin: https://evil.example' \
+            http://127.0.0.1:8000/api/v1/products
+          assert_code 200 http://127.0.0.1:8000/api/v1/products
+
+      - name: Assert a valid token reaches the upstream with actor headers
+        run: |
+          set -e
+          token=$(make token | tail -1)
+          seen=$(curl -s -o /dev/null -D - http://127.0.0.1:8000/api/v1/users/me \
+            -H "Authorization: Bearer $token" | grep -i '^x-mock-seen-user-id:' | tr -d '\r')
+          echo "$seen" | grep -q '01912f31-7a1b-7c12-9c55-8b1c34a6d921' \
+            || { echo "upstream did not receive the actor identity: $seen"; exit 1; }
+
+      - name: Assert a spoofed identity header never reaches the upstream
+        run: |
+          set -e
+          seen=$(curl -s -o /dev/null -D - http://127.0.0.1:8000/api/v1/products \
+            -H 'X-User-ID: attacker' | grep -ci 'x-mock-seen-user-id: attacker' || true)
+          [ "$seen" = "0" ] || { echo "spoofed X-User-ID reached the upstream"; exit 1; }
+
+      - name: Collect gateway logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Stop the stack
+        if: always()
+        run: make down
