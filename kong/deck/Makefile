@@ -27,6 +27,9 @@ $(ENV_VARS): $(ENV_FILE)
 
 $(RENDERED): kong.yaml $(ENV_VARS)
 	$(DECK_RUN) file render --populate-env-vars kong.yaml -o $(RENDERED)
+	# decK tạo file với mode 0600. Container Kong chạy bằng user `kong`, không phải user
+	# đã render, nên nếu không nới quyền đọc thì node chết ngay lúc nạp declarative config.
+	@chmod a+r $(RENDERED)
 
 render: $(RENDERED)
 
