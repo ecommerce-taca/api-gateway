@@ -2,6 +2,7 @@
 -- Logic thuần trên chuỗi: không đọc PDK, không phụ thuộc phase, nên test được đủ nhánh.
 
 local cjson = require "cjson.safe"
+local error_catalog = require "kong.plugins.taca-lib.error_catalog"
 local envelope_builder = require "kong.plugins.taca-lib.envelope_builder"
 
 local BUSINESS_CODE_PATTERN = "^[A-Z][A-Z0-9_]*$"
@@ -116,6 +117,29 @@ function _M.keep_business_error(raw_body, allowlist, trace_id)
       trace_id = upstream_error.trace_id or trace_id,
     },
   })
+end
+
+-- Các plugin taca-* thoát bằng envelope đã đúng mã lỗi. Nếu bỏ qua bước này, ánh xạ
+-- theo status sẽ ghi đè chúng: 401 GATEWAY_TOKEN_EXPIRED biến thành GATEWAY_INVALID_REQUEST
+-- và frontend mất khả năng phân biệt hết hạn với sai định dạng.
+function _M.keep_gateway_envelope(raw_body, trace_id)
+  local document = cjson.decode(raw_body or "")
+  if type(document) ~= "table" or type(document.error) ~= "table" then
+    return nil
+  end
+
+  if not error_catalog.is_known(document.error.code) then
+    return nil
+  end
+
+  local gateway_error = document.error
+  if gateway_error.trace_id and gateway_error.trace_id ~= "" then
+    return raw_body
+  end
+
+  gateway_error.trace_id = trace_id
+
+  return cjson.encode(document)
 end
 
 function _M.gateway_error(code, details, trace_id)

@@ -144,3 +144,75 @@ describe("taca-error-envelope handler", function()
     assert.equal("GATEWAY_REDIS_UNAVAILABLE", cjson.decode(body).error.code)
   end)
 end)
+
+describe("taca-error-envelope handler with plugin generated errors", function()
+  local original_arg
+
+  before_each(function()
+    original_arg = ngx.arg
+  end)
+
+  after_each(function()
+    ngx.arg = original_arg
+    kong_stub.uninstall()
+  end)
+
+  local function run_exit(status, body, request_headers)
+    kong_stub.install({
+      headers = request_headers or { ["X-Request-ID"] = TRACE_ID },
+      response_status = status,
+      response_source = "exit",
+    })
+
+    local plugin_config = config()
+    handler:access(plugin_config)
+    handler:header_filter(plugin_config)
+    ngx.arg = { body, true }
+    handler:body_filter(plugin_config)
+
+    return ngx.arg[1]
+  end
+
+  it("should keep the error code produced by another taca plugin", function()
+    local exit_body = cjson.encode({
+      error = {
+        code = "GATEWAY_TOKEN_EXPIRED",
+        message = "Phiên đăng nhập đã hết hạn.",
+        details = {},
+        trace_id = TRACE_ID,
+      },
+    })
+
+    assert.equal("GATEWAY_TOKEN_EXPIRED", cjson.decode(run_exit(401, exit_body)).error.code)
+  end)
+
+  it("should keep a permission denial produced by the rbac plugin", function()
+    local exit_body = cjson.encode({
+      error = {
+        code = "GATEWAY_PERMISSION_DENIED",
+        message = "Bạn không có quyền thực hiện thao tác này.",
+        details = {},
+        trace_id = TRACE_ID,
+      },
+    })
+
+    assert.equal("GATEWAY_PERMISSION_DENIED", cjson.decode(run_exit(403, exit_body)).error.code)
+  end)
+
+  it("should fill a missing trace id on an envelope produced before correlation id", function()
+    local exit_body = cjson.encode({
+      error = { code = "GATEWAY_CORS_DENIED", message = "Nguồn truy cập không được phép.",
+                details = {}, trace_id = "" },
+    })
+
+    local document = cjson.decode(run_exit(403, exit_body, { ["X-Request-ID"] = TRACE_ID }))
+
+    assert.equal(TRACE_ID, document.error.trace_id)
+  end)
+
+  it("should still replace a body carrying an unknown error code", function()
+    local exit_body = cjson.encode({ error = { code = "SOMETHING_ELSE", message = "nope" } })
+
+    assert.equal("GATEWAY_INVALID_REQUEST", cjson.decode(run_exit(400, exit_body)).error.code)
+  end)
+end)

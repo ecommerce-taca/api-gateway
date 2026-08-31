@@ -70,6 +70,11 @@ local function final_body(config, plan, raw_body)
     return body_rewriter.gateway_error("GATEWAY_UPSTREAM_BAD_RESPONSE", nil, plan.trace_id)
   end
 
+  local already_normalized = body_rewriter.keep_gateway_envelope(raw_body, plan.trace_id)
+  if already_normalized then
+    return already_normalized
+  end
+
   return body_rewriter.gateway_error(plan.code, plan.details, plan.trace_id)
 end
 
