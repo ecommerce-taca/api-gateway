@@ -2,3 +2,4 @@
 .claude/kong/deck/.build/
 __pycache__/
 *.pyc
+mocks/jwks/
