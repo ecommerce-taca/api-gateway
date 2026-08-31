@@ -8,20 +8,25 @@ local METRIC_DEFINITIONS = {
   taca_jwks_refresh_total = {
     kind = "counter",
     help = "JWKS refresh attempts by outcome",
-    label = "outcome",
-    allowed_labels = { success = true, failure = true, stale = true },
+    labels = { "outcome" },
+    allowed_values = {
+      outcome = { success = true, failure = true, stale = true },
+    },
   },
   taca_rate_limit_total = {
     kind = "counter",
     help = "Rate limit decisions by bucket and outcome",
-    label = "bucket",
-    allowed_labels = { auth = true, public = true, authenticated = true, ws = true },
+    labels = { "bucket", "outcome" },
+    allowed_values = {
+      bucket = { auth = true, public = true, authenticated = true, ws = true },
+      outcome = { allowed = true, blocked = true },
+    },
   },
   taca_ws_connections = {
     kind = "gauge",
     help = "Open WebSocket connections proxied by this node",
-    label = nil,
-    allowed_labels = nil,
+    labels = {},
+    allowed_values = {},
   },
 }
 
@@ -31,26 +36,38 @@ local function dict()
   return ngx.shared[SHARED_DICT_NAME]
 end
 
-local function series_key(metric_name, label_value)
+-- Label được ghép theo thứ tự khai báo để cùng một chuỗi series không sinh ra hai key
+-- khác nhau chỉ vì thứ tự pairs() khác nhau giữa hai lần chạy.
+local function series_key(metric_name, label_values)
   local definition = METRIC_DEFINITIONS[metric_name]
-  if not definition or not definition.label or not label_value then
-    return metric_name
-  end
-
-  if not definition.allowed_labels[label_value] then
+  if not definition then
     return nil
   end
 
-  return string.format('%s{%s="%s"}', metric_name, definition.label, label_value)
+  if #definition.labels == 0 then
+    return metric_name
+  end
+
+  local parts = {}
+  for _, label in ipairs(definition.labels) do
+    local value = (label_values or {})[label]
+    if not value or not definition.allowed_values[label][value] then
+      return nil
+    end
+
+    parts[#parts + 1] = string.format('%s="%s"', label, value)
+  end
+
+  return string.format("%s{%s}", metric_name, table.concat(parts, ","))
 end
 
-function _M.increment(metric_name, label_value)
+function _M.increment(metric_name, label_values)
   local store = dict()
   if not store then
     return
   end
 
-  local key = series_key(metric_name, label_value)
+  local key = series_key(metric_name, label_values)
   if not key then
     return
   end
