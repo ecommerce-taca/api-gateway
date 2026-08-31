@@ -21,6 +21,7 @@ function _M.install(options)
     exit_status = nil,
     exit_body = nil,
     exit_headers = nil,
+    status = nil,
     service_headers = {},
     cleared_headers = {},
     response_headers = lower_keys(options.response_headers),
@@ -60,7 +61,10 @@ function _M.install(options)
       return nil
     end,
     get_status = function()
-      return options.response_status or 200
+      return state.status or options.response_status or 200
+    end,
+    set_status = function(status)
+      state.status = status
     end,
     get_source = function()
       return options.response_source or "service"
