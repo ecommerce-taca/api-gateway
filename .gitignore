@@ -1,5 +1,11 @@
 .agent/
-.claude/kong/deck/.build/
+.claude/
+
+# Artifact sinh ra khi render cấu hình theo môi trường — không phải nguồn.
+kong/deck/.build/
+
+# Khoá dev cho JWKS mock: mỗi máy tự sinh bằng `make dev-keys`, không bao giờ commit.
+mocks/jwks/
+
 __pycache__/
 *.pyc
-mocks/jwks/
