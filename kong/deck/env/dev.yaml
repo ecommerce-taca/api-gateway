@@ -1,0 +1,29 @@
+# Giá trị môi trường dev — dùng cho docker-compose local.
+# Tên biến map sang §2.6 của LLD: DECK_<SERVICE>_TARGET = host:port của <SERVICE>_BASE_URL.
+# decK chỉ đọc biến môi trường có tiền tố DECK_; Makefile nạp file này thành env trước khi gọi deck.
+
+DECK_AUTH_USER_TARGET: mock-auth-user:8080
+DECK_PRODUCT_CATALOG_TARGET: mock-product-catalog:8080
+DECK_SEARCH_TARGET: mock-search:8080
+DECK_ORDER_COMMERCE_TARGET: mock-order-commerce:8080
+DECK_INVENTORY_TARGET: mock-inventory:8080
+DECK_PAYMENT_WALLET_TARGET: mock-payment-wallet:8080
+DECK_SHIPMENT_TARGET: mock-shipment:8080
+DECK_RATING_COMMENT_TARGET: mock-rating-comment:8080
+DECK_NOTIFICATION_TARGET: mock-notification:8080
+DECK_MESSAGE_TARGET: mock-message:8080
+
+DECK_REDIS_HOST: redis
+DECK_REDIS_PORT: 6379
+DECK_REDIS_DATABASE: 0
+
+DECK_JWT_ISSUER: http://mock-auth-user:8080
+DECK_JWT_AUDIENCE: taca-marketplace-api
+DECK_JWT_JWKS_URI: http://mock-auth-user:8080/.well-known/jwks.json
+
+DECK_CORS_ORIGIN_MFE_SHELL: http://localhost:4200
+DECK_CORS_ORIGIN_MFE_BUYER: http://localhost:4201
+DECK_CORS_ORIGIN_MFE_SELLER: http://localhost:4202
+DECK_CORS_ORIGIN_MFE_ADMIN: http://localhost:4203
+
+DECK_OTEL_TRACES_ENDPOINT: http://mock-otel-collector:8080/v1/traces
