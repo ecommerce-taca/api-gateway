@@ -6,8 +6,8 @@ describe("metrics_store", function()
   end)
 
   it("should render a counter with its allowlisted label", function()
-    metrics_store.increment("taca_jwks_refresh_total", "success")
-    metrics_store.increment("taca_jwks_refresh_total", "success")
+    metrics_store.increment("taca_jwks_refresh_total", { outcome = "success" })
+    metrics_store.increment("taca_jwks_refresh_total", { outcome = "success" })
 
     local rendered = metrics_store.render()
 
@@ -16,7 +16,20 @@ describe("metrics_store", function()
   end)
 
   it("should drop a label value outside the allowlist", function()
-    metrics_store.increment("taca_rate_limit_total", "user-01912f31")
+    metrics_store.increment("taca_rate_limit_total", { bucket = "user-01912f31", outcome = "blocked" })
+
+    assert.equal("", metrics_store.render())
+  end)
+
+  it("should render every declared label in declaration order", function()
+    metrics_store.increment("taca_rate_limit_total", { bucket = "ws", outcome = "blocked" })
+
+    assert.matches('taca_rate_limit_total{bucket="ws",outcome="blocked"} 1',
+                   metrics_store.render(), nil, true)
+  end)
+
+  it("should drop a counter missing one of its labels", function()
+    metrics_store.increment("taca_rate_limit_total", { bucket = "ws" })
 
     assert.equal("", metrics_store.render())
   end)
@@ -43,7 +56,7 @@ describe("metrics_store", function()
   end)
 
   it("should ignore an unknown metric name", function()
-    metrics_store.increment("something_else_total", "success")
+    metrics_store.increment("something_else_total", { outcome = "success" })
 
     assert.equal("", metrics_store.render())
   end)
