@@ -1,0 +1,9 @@
+-- Cấu hình busted cho unit test plugin (test doc §4.1).
+return {
+  default = {
+    verbose = true,
+    ["recursive"] = true,
+    ROOT = { "spec" },
+    pattern = "_spec%.lua$",
+  },
+}
