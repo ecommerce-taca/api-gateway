@@ -1,0 +1,3414 @@
+_format_version: "3.0"
+plugins:
+- config:
+    echo_downstream: true
+    generator: uuid
+    header_name: X-Request-ID
+  name: correlation-id
+- config:
+    credentials: false
+    headers:
+    - Authorization
+    - Content-Type
+    - X-Request-ID
+    - Idempotency-Key
+    max_age: 600
+    methods:
+    - GET
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    - OPTIONS
+    origins:
+    - http://localhost:4200
+    - http://localhost:4201
+    - http://localhost:4202
+    - http://localhost:4203
+    preflight_continue: false
+  name: cors
+- config:
+    custom_fields_by_lua:
+      request.headers.authorization: return nil
+      request.headers.cookie: return nil
+      request.headers[\"sec-websocket-protocol\"]: return nil
+      request.url: local url = kong.request.get_path_with_query() return (url:gsub('access_token=[^&]*',
+        'access_token=[REDACTED]'))
+      response.headers[\"set-cookie\"]: return nil
+    path: /dev/stdout
+    reopen: false
+  name: file-log
+- config:
+    header_type: w3c
+    resource_attributes:
+      service.name: api-gateway
+    traces_endpoint: http://mock-otel-collector:8080/v1/traces
+  name: opentelemetry
+- config:
+    bandwidth_metrics: true
+    latency_metrics: true
+    status_code_metrics: true
+    upstream_health_metrics: true
+  name: prometheus
+- config:
+    allowed_payload_size: 1
+    require_content_length: false
+    size_unit: megabytes
+  name: request-size-limiting
+- config:
+    allowed_business_error_codes: []
+    redis_backed_rate_limit: true
+  name: taca-error-envelope
+- config:
+    allowed_origins:
+    - http://localhost:4200
+    - http://localhost:4201
+    - http://localhost:4202
+    - http://localhost:4203
+    mode: proxy
+    request_id_header: X-Request-ID
+    request_id_max_length: 64
+    service_name: api-gateway
+    stripped_header_prefixes:
+    - X-User-
+    - X-Auth-
+    trusted_proxy_cidrs: []
+  name: taca-request-guard
+services:
+- connect_timeout: 2000
+  host: up-auth-user
+  name: svc-auth-user-read
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-auth-user-account-read
+    paths:
+    - /api/v1/users
+    - /api/v1/addresses
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-auth-user-admin-read
+    paths:
+    - /api/v1/admin/users
+    - /api/v1/admin/shops
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - RISK_MANAGER
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-auth-user-auth-read
+    paths:
+    - /api/v1/auth
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 10
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: false
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-auth-user-seller-account-read
+    paths:
+    - /api/v1/seller/onboarding
+    - /api/v1/seller/shop
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-auth-user-shop-follow-read
+    paths:
+    - ~/api/v1/shops/[^/]+/follow$
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 40
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-auth-user-shop-followers-read
+    paths:
+    - ~/api/v1/shops/[^/]+/followers/count$
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 40
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-auth-user-shop-profile-read
+    paths:
+    - ~/api/v1/shops/[^/]+$
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 10
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-auth-user
+  name: svc-auth-user-write
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-auth-user-account-write
+    paths:
+    - /api/v1/users
+    - /api/v1/addresses
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-auth-user-admin-write
+    paths:
+    - /api/v1/admin/users
+    - /api/v1/admin/shops
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - RISK_MANAGER
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-auth-user-auth-write
+    paths:
+    - /api/v1/auth
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 10
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: false
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-auth-user-seller-account-write
+    paths:
+    - /api/v1/seller/onboarding
+    - /api/v1/seller/shop
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-auth-user-shop-follow-write
+    paths:
+    - ~/api/v1/shops/[^/]+/follow$
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 40
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-inventory
+  name: svc-inventory-read
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-inventory-admin-read
+    paths:
+    - /api/v1/admin/inventory
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - CATALOG_ADMIN
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-inventory-seller-read
+    paths:
+    - /api/v1/seller/inventory
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-inventory
+  name: svc-inventory-write
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-inventory-admin-write
+    paths:
+    - /api/v1/admin/inventory
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - CATALOG_ADMIN
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-inventory-seller-write
+    paths:
+    - /api/v1/seller/inventory
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: 127.0.0.1
+  name: svc-kong-metrics
+  path: /metrics
+  port: 8100
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - GET
+    name: rt-ops-metrics
+    paths:
+    - /metrics
+    plugins:
+    - config:
+        redis_backed_rate_limit: false
+      name: taca-error-envelope
+    - config:
+        mode: metrics
+        service_name: api-gateway
+      name: taca-request-guard
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: true
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: 127.0.0.1
+  name: svc-kong-status
+  path: /status
+  port: 8100
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - GET
+    name: rt-ops-health-live
+    paths:
+    - /health/live
+    plugins:
+    - config:
+        redis_backed_rate_limit: false
+      name: taca-error-envelope
+    - config:
+        mode: liveness
+        service_name: api-gateway
+      name: taca-request-guard
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: true
+  - methods:
+    - GET
+    name: rt-ops-health-ready
+    paths:
+    - /health/ready
+    plugins:
+    - config:
+        redis_backed_rate_limit: false
+      name: taca-error-envelope
+    - config:
+        jwks:
+          jwks_max_stale_seconds: 1800
+          jwks_request_timeout_ms: 2000
+          jwks_shared_dict: taca_jwks
+          jwks_ttl_seconds: 600
+          jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+          lock_shared_dict: taca_locks
+        mode: readiness
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        service_name: api-gateway
+      name: taca-request-guard
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: true
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-message
+  name: svc-message-read
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-message-read
+    paths:
+    - /api/v1/conversations
+    - /api/v1/messages
+    - /api/v1/attachments
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-message
+  name: svc-message-write
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-message-write
+    paths:
+    - /api/v1/conversations
+    - /api/v1/messages
+    - /api/v1/attachments
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 5000
+  host: up-message
+  name: svc-message-ws
+  port: 80
+  protocol: http
+  read_timeout: 1800000
+  retries: 0
+  routes:
+  - methods:
+    - GET
+    name: rt-message-ws
+    paths:
+    - /ws/messages
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        accept_query_token: true
+        accept_websocket_subprotocol: true
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        connection_counter_ttl_seconds: 3600
+        max_connections_per_user: 10
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+      name: taca-ws-guard
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 1800000
+- connect_timeout: 2000
+  host: up-notification
+  name: svc-notification-read
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-notification-read
+    paths:
+    - /api/v1/notifications
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-notification
+  name: svc-notification-write
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-notification-write
+    paths:
+    - /api/v1/notifications
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-order-commerce
+  name: svc-order-commerce-checkout-write
+  port: 80
+  protocol: http
+  read_timeout: 10000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-order-commerce-checkout-write
+    paths:
+    - /api/v1/checkout
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 10000
+- connect_timeout: 2000
+  host: up-order-commerce
+  name: svc-order-commerce-read
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-order-commerce-admin-read
+    paths:
+    - /api/v1/admin/vouchers
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - VOUCHER_MANAGE
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-order-commerce-buyer-read
+    paths:
+    - /api/v1/cart
+    - /api/v1/checkout
+    - /api/v1/orders
+    - /api/v1/vouchers
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-order-commerce-seller-read
+    paths:
+    - /api/v1/seller/orders
+    - /api/v1/seller/vouchers
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-order-commerce-voucher-public-read
+    paths:
+    - ~/api/v1/vouchers$
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: false
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 50
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-order-commerce
+  name: svc-order-commerce-write
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-order-commerce-admin-write
+    paths:
+    - /api/v1/admin/vouchers
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - VOUCHER_MANAGE
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-order-commerce-buyer-write
+    paths:
+    - /api/v1/cart
+    - /api/v1/orders
+    - /api/v1/vouchers
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-order-commerce-seller-write
+    paths:
+    - /api/v1/seller/orders
+    - /api/v1/seller/vouchers
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-payment-wallet
+  name: svc-payment-wallet-read
+  port: 80
+  protocol: http
+  read_timeout: 10000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-payment-wallet-admin-read
+    paths:
+    - /api/v1/admin/payments
+    - /api/v1/admin/fees
+    - /api/v1/admin/taxes
+    - /api/v1/admin/settlements
+    - /api/v1/admin/finance
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - FINANCE_OPS
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-payment-wallet-buyer-read
+    paths:
+    - /api/v1/payments
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-payment-wallet-seller-read
+    paths:
+    - /api/v1/seller/wallet
+    - /api/v1/seller/payouts
+    - /api/v1/seller/revenue
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 10000
+- connect_timeout: 2000
+  host: up-payment-wallet
+  name: svc-payment-wallet-write
+  port: 80
+  protocol: http
+  read_timeout: 10000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-payment-wallet-admin-write
+    paths:
+    - /api/v1/admin/payments
+    - /api/v1/admin/fees
+    - /api/v1/admin/taxes
+    - /api/v1/admin/settlements
+    - /api/v1/admin/finance
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - FINANCE_OPS
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-payment-wallet-buyer-write
+    paths:
+    - /api/v1/payments
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-payment-wallet-seller-write
+    paths:
+    - /api/v1/seller/wallet
+    - /api/v1/seller/payouts
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-payment-wallet-webhook-write
+    paths:
+    - /api/v1/payments/webhook
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 10000
+- connect_timeout: 2000
+  host: up-product-catalog
+  name: svc-product-catalog-read
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-product-catalog-admin-read
+    paths:
+    - /api/v1/admin/catalog
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - CATALOG_ADMIN
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-product-catalog-public-read
+    paths:
+    - /api/v1/products
+    - /api/v1/categories
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-product-catalog-seller-read
+    paths:
+    - /api/v1/seller/products
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-product-catalog-shop-products-read
+    paths:
+    - ~/api/v1/shops/[^/]+/products$
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 40
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-product-catalog
+  name: svc-product-catalog-write
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-product-catalog-admin-write
+    paths:
+    - /api/v1/admin/catalog
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - CATALOG_ADMIN
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-product-catalog-public-write
+    paths:
+    - /api/v1/products
+    - /api/v1/categories
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+        - ADMIN
+        - CATALOG_ADMIN
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-product-catalog-seller-write
+    paths:
+    - /api/v1/seller/products
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-rating-comment
+  name: svc-rating-comment-read
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-rating-comment-product-read
+    paths:
+    - ~/api/v1/products/[^/]+/reviews$
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 60
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-rating-comment-public-read
+    paths:
+    - /api/v1/reviews
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-rating-comment-seller-read
+    paths:
+    - /api/v1/seller/reviews
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-rating-comment
+  name: svc-rating-comment-write
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-rating-comment-product-write
+    paths:
+    - ~/api/v1/products/[^/]+/reviews$
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 60
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-rating-comment-public-write
+    paths:
+    - /api/v1/reviews
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-rating-comment-seller-write
+    paths:
+    - /api/v1/seller/reviews
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-search
+  name: svc-search-read
+  port: 80
+  protocol: http
+  read_timeout: 5000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-search-admin-read
+    paths:
+    - /api/v1/admin/search
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - ADMIN
+        - CATALOG_ADMIN
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-search-public-read
+    paths:
+    - /api/v1/search
+    - /api/v1/products/search
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 5000
+- connect_timeout: 2000
+  host: up-shipment
+  name: svc-shipment-read
+  port: 80
+  protocol: http
+  read_timeout: 10000
+  retries: 1
+  routes:
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-shipment-buyer-read
+    paths:
+    - ~/api/v1/orders/[^/]+/shipment$
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 60
+    strip_path: false
+  - methods:
+    - GET
+    - HEAD
+    - OPTIONS
+    name: rt-shipment-seller-read
+    paths:
+    - ~/api/v1/seller/orders/[^/]+/shipment$
+    - ~/api/v1/seller/orders/[^/]+/shipment/carriers$
+    plugins:
+    - config:
+        fault_tolerant: false
+        header_name: X-User-ID
+        hide_client_headers: false
+        limit_by: header
+        minute: 300
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    - config:
+        allowed_algorithms:
+        - RS256
+        audience: taca-marketplace-api
+        clock_skew_seconds: 30
+        issuer: http://mock-auth-user:8080
+        jwks_max_stale_seconds: 1800
+        jwks_ttl_seconds: 600
+        jwks_uri: http://mock-auth-user:8080/.well-known/jwks.json
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout_ms: 500
+        revocation_check_enabled: true
+        token_required: true
+      name: taca-jwt
+    - config:
+        required_any_permission: []
+        required_roles:
+        - SELLER
+        - SELLER_STAFF
+      name: taca-rbac
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 60
+    strip_path: false
+  write_timeout: 10000
+- connect_timeout: 2000
+  host: up-shipment
+  name: svc-shipment-write
+  port: 80
+  protocol: http
+  read_timeout: 10000
+  retries: 0
+  routes:
+  - methods:
+    - POST
+    - PUT
+    - PATCH
+    - DELETE
+    name: rt-shipment-carrier-webhook-write
+    paths:
+    - /api/v1/webhooks/shipping
+    plugins:
+    - config:
+        fault_tolerant: false
+        hide_client_headers: false
+        limit_by: ip
+        minute: 120
+        policy: redis
+        redis:
+          database: 0
+          host: redis
+          port: 6379
+          timeout: 500
+      name: rate-limiting
+    preserve_host: false
+    protocols:
+    - http
+    - https
+    regex_priority: 0
+    strip_path: false
+  write_timeout: 10000
+upstreams:
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-auth-user
+  slots: 10000
+  targets:
+  - target: mock-auth-user:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-inventory
+  slots: 10000
+  targets:
+  - target: mock-inventory:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-message
+  slots: 10000
+  targets:
+  - target: mock-message:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-notification
+  slots: 10000
+  targets:
+  - target: mock-notification:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-order-commerce
+  slots: 10000
+  targets:
+  - target: mock-order-commerce:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-payment-wallet
+  slots: 10000
+  targets:
+  - target: mock-payment-wallet:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-product-catalog
+  slots: 10000
+  targets:
+  - target: mock-product-catalog:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-rating-comment
+  slots: 10000
+  targets:
+  - target: mock-rating-comment:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-search
+  slots: 10000
+  targets:
+  - target: mock-search:8080
+    weight: 100
+- hash_fallback: none
+  hash_on: none
+  hash_on_cookie_path: /
+  healthchecks:
+    active:
+      concurrency: 4
+      healthy:
+        http_statuses:
+        - 200
+        interval: 30
+        successes: 1
+      http_path: /health/live
+      timeout: 2
+      type: http
+      unhealthy:
+        http_failures: 3
+        http_statuses:
+        - 429
+        - 500
+        - 502
+        - 503
+        - 504
+        interval: 10
+        tcp_failures: 3
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses:
+        - 200
+        - 201
+        - 202
+        - 203
+        - 204
+        - 205
+        - 206
+        - 207
+        - 208
+        - 226
+        - 300
+        - 301
+        - 302
+        - 303
+        - 304
+        - 305
+        - 306
+        - 307
+        - 308
+        successes: 1
+      type: http
+      unhealthy:
+        http_failures: 5
+        http_statuses:
+        - 500
+        - 502
+        - 503
+        - 504
+        tcp_failures: 5
+        timeouts: 5
+  name: up-shipment
+  slots: 10000
+  targets:
+  - target: mock-shipment:8080
+    weight: 100

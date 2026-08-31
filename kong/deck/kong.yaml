@@ -1,0 +1,2830 @@
+# Declarative config của API Gateway — nguồn sự thật duy nhất cho Service/Route/Plugin/Upstream.
+# Kong chạy DB-less nên file này thay thế hoàn toàn database: rollback = revert commit rồi sync lại.
+#
+# Quy ước bắt buộc (LLD §2.1.4, §2.3):
+#   - Mỗi upstream tách hai Service: *-read (retries 1, chỉ GET/HEAD/OPTIONS) và *-write (retries 0).
+#     retries là thuộc tính của Service chứ không phải Route, nên đây là cách duy nhất để
+#     "chỉ retry GET" mà Kong hỗ trợ.
+#   - strip_path: false trên mọi route business — service đích nhận nguyên /api/v1/...
+#   - Không có route catch-all: path không khai báo thì Kong trả 404, đúng policy.
+#
+# Giá trị môi trường đến từ biến DECK_*; xem kong/deck/env/<môi trường>.yaml và Makefile.
+
+_format_version: "3.0"
+
+# ---------------------------------------------------------------------------
+# Plugin toàn cục — áp cho mọi route trừ khi route khai báo instance riêng
+# ---------------------------------------------------------------------------
+plugins:
+  # Sinh/giữ X-Request-ID ở đầu chuỗi access (LLD §2.2 bước 1). taca-request-guard
+  # chạy ngay sau và thay giá trị bằng UUIDv7 nếu client gửi giá trị không hợp lệ.
+  - name: correlation-id
+    config:
+      header_name: X-Request-ID
+      generator: uuid
+      echo_downstream: true
+
+  # PRIORITY 2100 — chạy trước cả cors (2000), vì cors của Kong trả 200 cho preflight
+  # của origin lạ thay vì 403 (LLD §2.1.3, IT-KONG-14).
+  - name: taca-request-guard
+    config:
+      mode: proxy
+      allowed_origins:
+        - ${{ env "DECK_CORS_ORIGIN_MFE_SHELL" }}
+        - ${{ env "DECK_CORS_ORIGIN_MFE_BUYER" }}
+        - ${{ env "DECK_CORS_ORIGIN_MFE_SELLER" }}
+        - ${{ env "DECK_CORS_ORIGIN_MFE_ADMIN" }}
+      request_id_header: X-Request-ID
+      request_id_max_length: 64
+      stripped_header_prefixes:
+        - X-User-
+        - X-Auth-
+      # Rỗng = không tin X-Forwarded-* của bất kỳ ai. Môi trường có ingress thật khai báo
+      # dải proxy ở đây và ở trusted_ips của kong.conf.
+      trusted_proxy_cidrs: []
+      service_name: api-gateway
+
+  # origins phải khớp từng dòng với taca-request-guard.allowed_origins ở trên: hai danh
+  # sách lệch nhau là lỗ hổng hoặc chặn nhầm frontend (LLD §8 #16, IT-KONG-15).
+  - name: cors
+    config:
+      origins:
+        - ${{ env "DECK_CORS_ORIGIN_MFE_SHELL" }}
+        - ${{ env "DECK_CORS_ORIGIN_MFE_BUYER" }}
+        - ${{ env "DECK_CORS_ORIGIN_MFE_SELLER" }}
+        - ${{ env "DECK_CORS_ORIGIN_MFE_ADMIN" }}
+      methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+      headers: [Authorization, Content-Type, X-Request-ID, Idempotency-Key]
+      max_age: 600
+      # Baseline dùng Bearer header, không dùng cookie; bật credentials sẽ kéo theo
+      # ràng buộc CSRF chưa được chốt (LLD §4, API §5 #4).
+      credentials: false
+      preflight_continue: false
+
+  - name: request-size-limiting
+    config:
+      allowed_payload_size: 1
+      size_unit: megabytes
+      require_content_length: false
+
+  # Lớp cuối cùng nhìn thấy response. redis_backed_rate_limit=true vì mọi route business
+  # đều có rate-limiting dùng Redis; ba route vận hành khai báo lại thành false.
+  - name: taca-error-envelope
+    config:
+      allowed_business_error_codes: []
+      redis_backed_rate_limit: true
+
+  - name: prometheus
+    config:
+      status_code_metrics: true
+      latency_metrics: true
+      bandwidth_metrics: true
+      upstream_health_metrics: true
+
+  - name: opentelemetry
+    config:
+      traces_endpoint: ${{ env "DECK_OTEL_TRACES_ENDPOINT" }}
+      # W3C traceparent để trace nối được xuyên suốt sang service đích (LLD §2.5).
+      header_type: w3c
+      resource_attributes:
+        service.name: api-gateway
+
+  # Log có cấu trúc + redaction tại chỗ. Access log của nginx đã tắt trong kong.conf vì
+  # nó không redact được ?access_token= trong URI (SEC-GW-12).
+  - name: file-log
+    config:
+      path: /dev/stdout
+      reopen: false
+      custom_fields_by_lua:
+        # Trả về nil để xoá hẳn field khỏi bản ghi log.
+        request.headers.authorization: "return nil"
+        request.headers.cookie: "return nil"
+        request.headers[\"sec-websocket-protocol\"]: "return nil"
+        response.headers[\"set-cookie\"]: "return nil"
+        request.url: "local url = kong.request.get_path_with_query() return (url:gsub('access_token=[^&]*', 'access_token=[REDACTED]'))"
+
+# ---------------------------------------------------------------------------
+# Upstream — mỗi domain service một upstream, target lấy từ biến môi trường
+# ---------------------------------------------------------------------------
+# Circuit breaker của thiết kế được thực thi bằng healthcheck của Kong (LLD §5.2):
+#   passive.unhealthy  ~ CIRCUIT_FAILURE_THRESHOLD (5 lỗi) → target bị eject  ~ OPEN
+#   active.healthy     ~ CIRCUIT_OPEN_DURATION (30s probe) → target trở lại   ~ HALF_OPEN → CLOSED
+#
+# LỆCH ĐÃ BIẾT (LLD §8 #15): passive healthcheck của Kong đếm lỗi LIÊN TIẾP, không theo
+# cửa sổ 30s như CIRCUIT_WINDOW. Traffic thành công/thất bại xen kẽ có thể không bao giờ
+# chạm ngưỡng. Đây là ngữ nghĩa của Kong OSS, đã chấp nhận, không mô phỏng thêm.
+#
+# 429 cố ý KHÔNG nằm trong unhealthy.http_statuses (mặc định của Kong có): 429 là câu trả
+# lời hợp lệ của service, đếm nó sẽ eject target ngay giữa đợt traffic cao.
+upstreams:
+  # Auth/user/profile/address/shop-profile/KYC
+  - name: up-auth-user
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_AUTH_USER_TARGET" }}
+        weight: 100
+
+  # Catalog SPU/SKU, category, shop products
+  - name: up-product-catalog
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_PRODUCT_CATALOG_TARGET" }}
+        weight: 100
+
+  # Search index và gợi ý
+  - name: up-search
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_SEARCH_TARGET" }}
+        weight: 100
+
+  # Cart, checkout, order, voucher
+  - name: up-order-commerce
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_ORDER_COMMERCE_TARGET" }}
+        weight: 100
+
+  # Tồn kho seller/admin
+  - name: up-inventory
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_INVENTORY_TARGET" }}
+        weight: 100
+
+  # Payment, wallet, payout, finance admin
+  - name: up-payment-wallet
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_PAYMENT_WALLET_TARGET" }}
+        weight: 100
+
+  # Vận đơn và webhook carrier
+  - name: up-shipment
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_SHIPMENT_TARGET" }}
+        weight: 100
+
+  # Review và trả lời review
+  - name: up-rating-comment
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_RATING_COMMENT_TARGET" }}
+        weight: 100
+
+  # Notification center
+  - name: up-notification
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_NOTIFICATION_TARGET" }}
+        weight: 100
+
+  # Conversation, message REST và WebSocket
+  - name: up-message
+    slots: 10000
+    healthchecks:
+      passive:
+        type: http
+        healthy:
+          successes: 1
+        unhealthy:
+          http_failures: 5
+          timeouts: 5
+          tcp_failures: 5
+          http_statuses: [500, 502, 503, 504]
+      active:
+        type: http
+        http_path: /health/live
+        timeout: 2
+        concurrency: 4
+        healthy:
+          interval: 30
+          successes: 1
+          http_statuses: [200]
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          tcp_failures: 3
+          http_statuses: [429, 500, 502, 503, 504]
+    targets:
+      - target: ${{ env "DECK_MESSAGE_TARGET" }}
+        weight: 100
+
+# ---------------------------------------------------------------------------
+# Service và Route
+# ---------------------------------------------------------------------------
+services:
+
+  # auth-user, đường đọc — retries 1 vì GET/HEAD idempotent (LLD §2.1.4)
+  - name: svc-auth-user-read
+    host: up-auth-user
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 1 — /auth: public tuỳ endpoint. Token là tuỳ chọn để endpoint protected (signout/2FA) vẫn nhận actor context; danh sách endpoint chính xác thuộc API spec của auth-user (API §5 #1)
+      - name: rt-auth-user-auth-read
+        paths: ["/api/v1/auth"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTH_RATE_LIMIT — 10 req/phút/IP cho signup/signin/OTP/reset
+        - name: rate-limiting
+          config:
+            minute: 10
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: false
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 2 — profile/address/favorites/following: bắt buộc JWT
+      - name: rt-auth-user-account-read
+        paths: ["/api/v1/users", "/api/v1/addresses"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 3 — seller onboarding/shop
+      - name: rt-auth-user-seller-account-read
+        paths: ["/api/v1/seller/onboarding", "/api/v1/seller/shop"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 4 — admin user/KYC: coarse gate theo role admin quản trị người dùng; permission chi tiết và 2FA do auth-user enforce (IT-GW-18/19)
+      - name: rt-auth-user-admin-read
+        paths: ["/api/v1/admin/users", "/api/v1/admin/shops"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, RISK_MANAGER]
+            required_any_permission: []
+      # Family 5 — GET /shops/{id} công khai
+      - name: rt-auth-user-shop-profile-read
+        paths: ["~/api/v1/shops/[^/]+$"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 10
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+      # Family 5 — đếm follower công khai (API §1.4)
+      - name: rt-auth-user-shop-followers-read
+        paths: ["~/api/v1/shops/[^/]+/followers/count$"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 40
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+      # Family 5 — trạng thái follow của chính user
+      - name: rt-auth-user-shop-follow-read
+        paths: ["~/api/v1/shops/[^/]+/follow$"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 40
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+
+  # auth-user, đường ghi — retries 0: không bao giờ retry mutation (LLD §3.5)
+  - name: svc-auth-user-write
+    host: up-auth-user
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 1 — signup/signin/refresh/reset/2FA
+      - name: rt-auth-user-auth-write
+        paths: ["/api/v1/auth"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTH_RATE_LIMIT — 10 req/phút/IP cho signup/signin/OTP/reset
+        - name: rate-limiting
+          config:
+            minute: 10
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: false
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 2 — cập nhật profile/address
+      - name: rt-auth-user-account-write
+        paths: ["/api/v1/users", "/api/v1/addresses"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 3 — nộp hồ sơ KYC, cập nhật shop
+      - name: rt-auth-user-seller-account-write
+        paths: ["/api/v1/seller/onboarding", "/api/v1/seller/shop"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 4 — duyệt KYC, khoá/mở user
+      - name: rt-auth-user-admin-write
+        paths: ["/api/v1/admin/users", "/api/v1/admin/shops"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, RISK_MANAGER]
+            required_any_permission: []
+      # Family 5 — follow/unfollow shop
+      - name: rt-auth-user-shop-follow-write
+        paths: ["~/api/v1/shops/[^/]+/follow$"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 40
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+
+  # product-catalog, đường đọc
+  - name: svc-product-catalog-read
+    host: up-product-catalog
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 6 — catalog công khai
+      - name: rt-product-catalog-public-read
+        paths: ["/api/v1/products", "/api/v1/categories"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+      # Family 6 — sản phẩm của một shop (ownership route: product-catalog, LLD §8 #9)
+      - name: rt-product-catalog-shop-products-read
+        paths: ["~/api/v1/shops/[^/]+/products$"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 40
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+      # Family 7 — seller xem sản phẩm của mình
+      - name: rt-product-catalog-seller-read
+        paths: ["/api/v1/seller/products"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 8 — admin catalog (IT-GW-32)
+      - name: rt-product-catalog-admin-read
+        paths: ["/api/v1/admin/catalog"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, CATALOG_ADMIN]
+            required_any_permission: []
+
+  # product-catalog, đường ghi
+  - name: svc-product-catalog-write
+    host: up-product-catalog
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 6 — mutation catalog: role-gated, ownership/KYC do product-catalog quyết định
+      - name: rt-product-catalog-public-write
+        paths: ["/api/v1/products", "/api/v1/categories"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF, ADMIN, CATALOG_ADMIN]
+            required_any_permission: []
+      # Family 7 — seller tạo/sửa/publish SPU-SKU (IT-GW-16/17)
+      - name: rt-product-catalog-seller-write
+        paths: ["/api/v1/seller/products"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 8 — admin sửa catalog
+      - name: rt-product-catalog-admin-write
+        paths: ["/api/v1/admin/catalog"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, CATALOG_ADMIN]
+            required_any_permission: []
+
+  # search — chỉ có đường đọc; POST tới /search không khai báo nên trả 404
+  - name: svc-search-read
+    host: up-search
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 9 — search công khai; /products/search là prefix dài hơn /products nên thắng route catalog
+      - name: rt-search-public-read
+        paths: ["/api/v1/search", "/api/v1/products/search"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+      # Family 9 — admin search
+      - name: rt-search-admin-read
+        paths: ["/api/v1/admin/search"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, CATALOG_ADMIN]
+            required_any_permission: []
+  # order-commerce, đường đọc
+  - name: svc-order-commerce-read
+    host: up-order-commerce
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 10 — cart/checkout/order/voucher của buyer
+      - name: rt-order-commerce-buyer-read
+        paths: ["/api/v1/cart", "/api/v1/checkout", "/api/v1/orders", "/api/v1/vouchers"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 10a — GET /vouchers công khai cho voucher strip ở PDP; có JWT thì service tính thêm eligible nên token là tuỳ chọn
+      - name: rt-order-commerce-voucher-public-read
+        paths: ["~/api/v1/vouchers$"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 50
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: false
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 11 — seller xem đơn và voucher của shop
+      - name: rt-order-commerce-seller-read
+        paths: ["/api/v1/seller/orders", "/api/v1/seller/vouchers"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 12 — admin voucher
+      - name: rt-order-commerce-admin-read
+        paths: ["/api/v1/admin/vouchers"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, VOUCHER_MANAGE]
+            required_any_permission: []
+
+  # order-commerce, đường ghi
+  - name: svc-order-commerce-write
+    host: up-order-commerce
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 10 — mutation cart/order/voucher. Không retry: idempotency key thuộc service sở hữu nghiệp vụ (LLD §2.3)
+      - name: rt-order-commerce-buyer-write
+        paths: ["/api/v1/cart", "/api/v1/orders", "/api/v1/vouchers"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 11 — seller cập nhật đơn/voucher
+      - name: rt-order-commerce-seller-write
+        paths: ["/api/v1/seller/orders", "/api/v1/seller/vouchers"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 12 — admin sửa voucher
+      - name: rt-order-commerce-admin-write
+        paths: ["/api/v1/admin/vouchers"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, VOUCHER_MANAGE]
+            required_any_permission: []
+
+  # order-commerce, riêng checkout — UPSTREAM_READ_TIMEOUT_LONG 10s (LLD §2.3)
+  - name: svc-order-commerce-checkout-write
+    host: up-order-commerce
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 10000
+    write_timeout: 10000
+    routes:
+      # Family 10 — POST /checkout: prefix dài hơn nên thắng route buyer-write
+      - name: rt-order-commerce-checkout-write
+        paths: ["/api/v1/checkout"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+
+  # inventory, đường đọc. Route /internal/** cố ý KHÔNG khai báo — không có Route nghĩa là Kong trả 404, đây là lớp chặn thứ nhất (LLD §2.3)
+  - name: svc-inventory-read
+    host: up-inventory
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 13 — seller xem tồn kho
+      - name: rt-inventory-seller-read
+        paths: ["/api/v1/seller/inventory"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 13 — admin xem tồn kho
+      - name: rt-inventory-admin-read
+        paths: ["/api/v1/admin/inventory"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, CATALOG_ADMIN]
+            required_any_permission: []
+
+  # inventory, đường ghi
+  - name: svc-inventory-write
+    host: up-inventory
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 13 — seller điều chỉnh tồn
+      - name: rt-inventory-seller-write
+        paths: ["/api/v1/seller/inventory"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 13 — admin điều chỉnh tồn
+      - name: rt-inventory-admin-write
+        paths: ["/api/v1/admin/inventory"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, CATALOG_ADMIN]
+            required_any_permission: []
+
+  # payment-wallet, đường đọc — read_timeout 10s cho toàn nhánh (LLD §2.3)
+  - name: svc-payment-wallet-read
+    host: up-payment-wallet
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 10000
+    write_timeout: 10000
+    routes:
+      # Family 14 — buyer/seller xem giao dịch
+      - name: rt-payment-wallet-buyer-read
+        paths: ["/api/v1/payments"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 14 — ví, payout, doanh thu và /revenue/export của seller
+      - name: rt-payment-wallet-seller-read
+        paths: ["/api/v1/seller/wallet", "/api/v1/seller/payouts", "/api/v1/seller/revenue"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 14 — admin finance (IT-GW-30/31)
+      - name: rt-payment-wallet-admin-read
+        paths: ["/api/v1/admin/payments", "/api/v1/admin/fees", "/api/v1/admin/taxes", "/api/v1/admin/settlements", "/api/v1/admin/finance"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, FINANCE_OPS]
+            required_any_permission: []
+
+  # payment-wallet, đường ghi
+  - name: svc-payment-wallet-write
+    host: up-payment-wallet
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 10000
+    write_timeout: 10000
+    routes:
+      # Family 14 — tạo thanh toán; không retry, duplicate protection ở service (IT-GW-20)
+      - name: rt-payment-wallet-buyer-write
+        paths: ["/api/v1/payments"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 14 — webhook cổng thanh toán: không JWT, chữ ký do payment-wallet kiểm. Prefix dài hơn nên thắng route buyer-write
+      - name: rt-payment-wallet-webhook-write
+        paths: ["/api/v1/payments/webhook"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+      # Family 14 — seller yêu cầu payout
+      - name: rt-payment-wallet-seller-write
+        paths: ["/api/v1/seller/wallet", "/api/v1/seller/payouts"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+      # Family 14 — admin finance mutation
+      - name: rt-payment-wallet-admin-write
+        paths: ["/api/v1/admin/payments", "/api/v1/admin/fees", "/api/v1/admin/taxes", "/api/v1/admin/settlements", "/api/v1/admin/finance"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [ADMIN, FINANCE_OPS]
+            required_any_permission: []
+  # shipment, đường đọc — read_timeout 10s (LLD §2.3)
+  - name: svc-shipment-read
+    host: up-shipment
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 10000
+    write_timeout: 10000
+    routes:
+      # Family 15 — buyer tra vận đơn. Regex nên được ưu tiên hơn prefix /api/v1/orders của order-commerce
+      - name: rt-shipment-buyer-read
+        paths: ["~/api/v1/orders/[^/]+/shipment$"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 60
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 15 — seller tra vận đơn và danh sách carrier
+      - name: rt-shipment-seller-read
+        paths: ["~/api/v1/seller/orders/[^/]+/shipment$", "~/api/v1/seller/orders/[^/]+/shipment/carriers$"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 60
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+
+  # shipment, đường ghi
+  - name: svc-shipment-write
+    host: up-shipment
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 10000
+    write_timeout: 10000
+    routes:
+      # Family 15 — webhook carrier: không JWT, chữ ký do shipment kiểm
+      - name: rt-shipment-carrier-webhook-write
+        paths: ["/api/v1/webhooks/shipping"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+
+  # rating-comment, đường đọc
+  - name: svc-rating-comment-read
+    host: up-rating-comment
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 16 — review của một sản phẩm, công khai. Regex thắng prefix /api/v1/products của product-catalog
+      - name: rt-rating-comment-product-read
+        paths: ["~/api/v1/products/[^/]+/reviews$"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 60
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+      # Family 16 — đọc review công khai
+      - name: rt-rating-comment-public-read
+        paths: ["/api/v1/reviews"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # PUBLIC_RATE_LIMIT — 120 req/phút/IP
+        - name: rate-limiting
+          config:
+            minute: 120
+            policy: redis
+            limit_by: ip
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+      # Family 16 — seller xem review shop mình
+      - name: rt-rating-comment-seller-read
+        paths: ["/api/v1/seller/reviews"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+
+  # rating-comment, đường ghi
+  - name: svc-rating-comment-write
+    host: up-rating-comment
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 16 — buyer viết review
+      - name: rt-rating-comment-product-write
+        paths: ["~/api/v1/products/[^/]+/reviews$"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        regex_priority: 60
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 16 — sửa/xoá review của chính mình
+      - name: rt-rating-comment-public-write
+        paths: ["/api/v1/reviews"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+      # Family 16 — seller trả lời review
+      - name: rt-rating-comment-seller-write
+        paths: ["/api/v1/seller/reviews"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-rbac
+          config:
+            required_roles: [SELLER, SELLER_STAFF]
+            required_any_permission: []
+
+  # notification, đường đọc
+  - name: svc-notification-read
+    host: up-notification
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 17 — notification center
+      - name: rt-notification-read
+        paths: ["/api/v1/notifications"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+
+  # notification, đường ghi
+  - name: svc-notification-write
+    host: up-notification
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 17 — đánh dấu đã đọc, cập nhật tuỳ chọn
+      - name: rt-notification-write
+        paths: ["/api/v1/notifications"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+
+  # message, đường đọc REST
+  - name: svc-message-read
+    host: up-message
+    port: 80
+    protocol: http
+    retries: 1
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 18 — REST là source of truth khi client reconnect (LLD §3.9)
+      - name: rt-message-read
+        paths: ["/api/v1/conversations", "/api/v1/messages", "/api/v1/attachments"]
+        methods: [GET, HEAD, OPTIONS]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+
+  # message, đường ghi REST
+  - name: svc-message-write
+    host: up-message
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Family 18 — gửi message, tạo conversation, metadata attachment
+      - name: rt-message-write
+        paths: ["/api/v1/conversations", "/api/v1/messages", "/api/v1/attachments"]
+        methods: [POST, PUT, PATCH, DELETE]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+
+  # message, tunnel WebSocket. retries 0: handshake không bao giờ được retry. connect_timeout = WS_HANDSHAKE_TIMEOUT 5s, read_timeout = WS_IDLE_TIMEOUT 1800s. Tuyệt đối không gắn plugin đọc/ghi body lên route này (LLD §3.9)
+  - name: svc-message-ws
+    host: up-message
+    port: 80
+    protocol: http
+    retries: 0
+    connect_timeout: 5000
+    read_timeout: 1800000
+    write_timeout: 1800000
+    routes:
+      # Family 19 — path WebSocket duy nhất được upgrade; mọi /ws/** khác không có Route nên trả 404
+      - name: rt-message-ws
+        paths: ["/ws/messages"]
+        methods: [GET]
+        strip_path: false
+        preserve_host: false
+        plugins:
+        # AUTHENTICATED_RATE_LIMIT — 300 req/phút/user
+        - name: rate-limiting
+          config:
+            minute: 300
+            policy: redis
+            limit_by: header
+            header_name: X-User-ID
+            # fault_tolerant mặc định của Kong là true (cho request đi qua khi Redis lỗi),
+            # vi phạm policy fail-closed §3.6 — phải để false.
+            fault_tolerant: false
+            hide_client_headers: false
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout: 500
+        - name: taca-jwt
+          config:
+            issuer: ${{ env "DECK_JWT_ISSUER" }}
+            audience: ${{ env "DECK_JWT_AUDIENCE" }}
+            jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+            allowed_algorithms: [RS256]
+            clock_skew_seconds: 30
+            jwks_ttl_seconds: 600
+            jwks_max_stale_seconds: 1800
+            token_required: true
+            accept_websocket_subprotocol: true
+            accept_query_token: true
+            revocation_check_enabled: true
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+        - name: taca-ws-guard
+          config:
+            max_connections_per_user: 10
+            # TTL dài hơn WS_IDLE_TIMEOUT (1800s) để counter không hết hạn khi socket còn
+            # mở, và vẫn tự dọn nếu node chết trước khi phase log chạy (DB §3.1.2).
+            connection_counter_ttl_seconds: 3600
+            redis:
+              host: ${{ env "DECK_REDIS_HOST" }}
+              port: ${{ env "DECK_REDIS_PORT" }}
+              database: ${{ env "DECK_REDIS_DATABASE" }}
+              timeout_ms: 500
+
+  # Endpoint vận hành. Nguồn thật là status listener của chính node (kong.conf
+  # status_listen 0.0.0.0:8100), expose lại dưới path contract qua Route nội bộ (LLD §2.1.5).
+  # Admin API :8001 chỉ bind loopback và không có Route nào trỏ tới (SEC-GW-14).
+  - name: svc-kong-status
+    host: 127.0.0.1
+    port: 8100
+    protocol: http
+    path: /status
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      # Liveness: taca-request-guard chế độ liveness dịch body /status của Kong sang
+      # contract {status, service, time} của API §3.1.
+      - name: rt-ops-health-live
+        paths: ["/health/live"]
+        methods: [GET]
+        strip_path: true
+        preserve_host: false
+        plugins:
+          - name: taca-request-guard
+            config:
+              mode: liveness
+              service_name: api-gateway
+          # Ba route vận hành tự sinh body của mình; cờ redis ở instance toàn cục không
+          # đúng ở đây vì các route này không có rate-limiting.
+          - name: taca-error-envelope
+            config:
+              redis_backed_rate_limit: false
+
+      # Readiness: plugin tự kiểm config/JWKS/Redis/upstream rồi thoát ngay ở phase access,
+      # nên upstream status listener không bị gọi (LLD §2.1.5, API §3.2).
+      - name: rt-ops-health-ready
+        paths: ["/health/ready"]
+        methods: [GET]
+        strip_path: true
+        preserve_host: false
+        plugins:
+          - name: taca-request-guard
+            config:
+              mode: readiness
+              service_name: api-gateway
+              jwks:
+                jwks_uri: ${{ env "DECK_JWT_JWKS_URI" }}
+                jwks_shared_dict: taca_jwks
+                lock_shared_dict: taca_locks
+                jwks_ttl_seconds: 600
+                jwks_max_stale_seconds: 1800
+                jwks_request_timeout_ms: 2000
+              redis:
+                host: ${{ env "DECK_REDIS_HOST" }}
+                port: ${{ env "DECK_REDIS_PORT" }}
+                database: ${{ env "DECK_REDIS_DATABASE" }}
+                timeout_ms: 500
+          - name: taca-error-envelope
+            config:
+              redis_backed_rate_limit: false
+
+  # /metrics do plugin prometheus sinh trên status listener; taca-request-guard chế độ
+  # metrics nối thêm các counter custom không có tương đương native (API §3.3).
+  - name: svc-kong-metrics
+    host: 127.0.0.1
+    port: 8100
+    protocol: http
+    path: /metrics
+    retries: 0
+    connect_timeout: 2000
+    read_timeout: 5000
+    write_timeout: 5000
+    routes:
+      - name: rt-ops-metrics
+        paths: ["/metrics"]
+        methods: [GET]
+        strip_path: true
+        preserve_host: false
+        plugins:
+          - name: taca-request-guard
+            config:
+              mode: metrics
+              service_name: api-gateway
+          - name: taca-error-envelope
+            config:
+              redis_backed_rate_limit: false
