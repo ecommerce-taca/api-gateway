@@ -4,7 +4,6 @@
 .agent
 .claude
 docs
-spec
 tools
 mocks
 docker-compose.yml
