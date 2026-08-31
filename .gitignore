@@ -1,2 +1,4 @@
 .agent/
 .claude/kong/deck/.build/
+__pycache__/
+*.pyc
