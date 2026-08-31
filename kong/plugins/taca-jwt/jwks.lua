@@ -108,20 +108,20 @@ local function refresh_now(config)
 
   local document, fetch_err = _M.fetch_jwks(config)
   if not document then
-    metrics_store.increment(METRIC_NAME, "failure")
+    metrics_store.increment(METRIC_NAME, { outcome = "failure" })
     kong.log.err("jwks refresh failed: ", fetch_err)
     return nil, JWKS_UNAVAILABLE
   end
 
   local written, write_err = write_keys(store, document, config.jwks_max_stale_seconds * 2)
   if not written then
-    metrics_store.increment(METRIC_NAME, "failure")
+    metrics_store.increment(METRIC_NAME, { outcome = "failure" })
     kong.log.err("jwks shared dict write failed: ", write_err)
     return nil, JWKS_UNAVAILABLE
   end
 
   store:set(LOADED_AT_KEY, ngx.time())
-  metrics_store.increment(METRIC_NAME, "success")
+  metrics_store.increment(METRIC_NAME, { outcome = "success" })
 
   return written
 end
@@ -232,7 +232,7 @@ function _M.get_public_key(config, kid)
     if state == _M.states.STALE then
       local key = read_key(config, kid)
       if key then
-        metrics_store.increment(METRIC_NAME, "stale")
+        metrics_store.increment(METRIC_NAME, { outcome = "stale" })
         return key
       end
     end
