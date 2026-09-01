@@ -58,6 +58,11 @@ services:
         condition: service_healthy
       mock-upstreams:
         condition: service_healthy
+    environment:
+      # DEV-ONLY: mở Admin API trên mạng nội bộ Docker để Konga quan sát (read-only).
+      # Kong chạy DB-less nên Admin API vẫn chỉ đọc. kong.conf giữ loopback cho production;
+      # override này chỉ nằm trong compose local và KHÔNG publish 8001 ra host (SEC-GW-14).
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
     volumes:
       - ./kong/deck/.build/kong.dev.yaml:/kong/declarative/kong.yaml:ro
     networks: [gateway]
@@ -76,12 +81,66 @@ services:
         condition: service_healthy
       mock-upstreams:
         condition: service_healthy
+    environment:
+      # DEV-ONLY: giống kong-node-1 — chỉ để Konga quan sát qua mạng nội bộ, không publish 8001.
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
     volumes:
       - ./kong/deck/.build/kong.dev.yaml:/kong/declarative/kong.yaml:ro
     networks: [gateway]
     ports:
       - "127.0.0.1:8010:8000"
       - "127.0.0.1:8110:8100"
+
+  # GUI quan sát cấu hình Kong (read-only, phần phụ — không thuộc thiết kế gốc).
+  # Konga kết nối Admin API :8001 của kong-node-1 qua mạng nội bộ. Konga 0.14.9 bắt buộc
+  # có database riêng (adapter `local` đã bị bỏ), nên kèm MySQL 5.7 bên dưới — Kong
+  # vẫn DB-less, không đổi gì. Kong DB-less → Admin API chỉ đọc → Konga chỉ XEM, không sửa.
+  # Lưu ý: image pantsel/konga (0.14.9, 2021) không còn được bảo trì; chỉ dùng ở local.
+  konga:
+    image: pantsel/konga:0.14.9
+    depends_on:
+      konga-db:
+        condition: service_healthy
+      kong-node-1:
+        condition: service_started
+      kong-node-2:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      DB_ADAPTER: mysql
+      DB_HOST: konga-db
+      DB_PORT: 3306
+      DB_USER: konga
+      DB_PASSWORD: konga
+      DB_DATABASE: konga
+    # Tự chạy `prepare` (tạo schema + seed) trước khi nâng app, để `make up` trên máy mới
+    # không dính lỗi "konga_users doesn't exist". prepare là idempotent (create-if-not-exists).
+    # Image có ENTRYPOINT=/app/start.sh nên phải override sang sh -c mới chạy được chuỗi lệnh.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "/app/start.sh -c prepare -a mysql -u mysql://konga:konga@konga-db:3306/konga && node --harmony /app/app.js"
+    networks: [gateway]
+    ports:
+      - "127.0.0.1:1337:1337"
+
+  # MySQL chỉ phục vụ Konga (lưu tài khoản + connection của Konga), không liên quan Kong.
+  # Dùng MySQL 5.7 vì Konga 0.14.9 (2021) bó driver pg cũ không hợp Postgres hiện đại.
+  konga-db:
+    image: mysql:5.7
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: konga
+      MYSQL_DATABASE: konga
+      MYSQL_USER: konga
+      MYSQL_PASSWORD: konga
+    volumes:
+      - konga-db-data:/var/lib/mysql
+    networks: [gateway]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ukonga", "-pkonga"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
 
 networks:
   gateway:
@@ -90,3 +149,5 @@ networks:
 volumes:
   redis-data:
     name: taca-gateway-redis-data
+  konga-db-data:
+    name: taca-gateway-konga-db-data
