@@ -19,13 +19,8 @@ local _M = {}
 _M.headers = ACTOR_HEADERS
 
 local function safe_list(claim)
-  if type(claim) == "string" then
-    claim = { claim }
-  end
-
-  if type(claim) ~= "table" then
-    return {}
-  end
+  if type(claim) == "string" then claim = { claim } end
+  if type(claim) ~= "table" then return {} end
 
   local values = {}
   for _, value in ipairs(claim) do

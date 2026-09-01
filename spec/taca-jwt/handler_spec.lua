@@ -2,6 +2,7 @@ local kong_stub = require "spec.helpers.kong_stub"
 local jwt_fixture = require "spec.helpers.jwt_fixture"
 local jwks = require "kong.plugins.taca-jwt.jwks"
 local handler = require "kong.plugins.taca-jwt.handler"
+local redis_client = require "kong.plugins.taca-lib.redis_client"
 
 describe("taca-jwt handler", function()
   local signing_key, original_fetcher, original_redis_builder
@@ -9,7 +10,7 @@ describe("taca-jwt handler", function()
   setup(function()
     signing_key = jwt_fixture.new_key("key-01")
     original_fetcher = jwks.fetch_jwks
-    original_redis_builder = handler.build_redis_client
+    original_redis_builder = redis_client.new
   end)
 
   before_each(function()
@@ -22,7 +23,7 @@ describe("taca-jwt handler", function()
 
   after_each(function()
     jwks.fetch_jwks = original_fetcher
-    handler.build_redis_client = original_redis_builder
+    redis_client.new = original_redis_builder
     kong_stub.uninstall()
   end)
 
@@ -34,7 +35,7 @@ describe("taca-jwt handler", function()
   end
 
   local function stub_redis(behaviour)
-    handler.build_redis_client = function()
+    redis_client.new = function()
       return behaviour
     end
   end

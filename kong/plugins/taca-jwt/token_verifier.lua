@@ -11,31 +11,31 @@ local _M = {}
 
 local function decode_base64url(input)
   local normalized = string.gsub(string.gsub(input, "-", "+"), "_", "/")
-
   local padding = #normalized % 4
-  if padding == 2 then
-    normalized = normalized .. "=="
-  elseif padding == 3 then
-    normalized = normalized .. "="
-  elseif padding == 1 then
-    return nil
-  end
+
+  -- Dư đúng 1 ký tự thì không có cách pad hợp lệ nào: segment hỏng.
+  if padding == 1 then return nil end
+  if padding > 0 then normalized = normalized .. string.rep("=", 4 - padding) end
 
   return ngx.decode_base64(normalized)
 end
 
 _M.decode_base64url = decode_base64url
 
-function _M.parse(token)
-  if type(token) ~= "string" then
-    return nil, TOKEN_INVALID
+local function contains(list, value)
+  for _, item in ipairs(list) do
+    if item == value then return true end
   end
+
+  return false
+end
+
+function _M.parse(token)
+  if type(token) ~= "string" then return nil, TOKEN_INVALID end
 
   local header_segment, payload_segment, signature_segment =
     string.match(token, "^([^%.]+)%.([^%.]+)%.([^%.]+)$")
-  if not header_segment then
-    return nil, TOKEN_INVALID
-  end
+  if not header_segment then return nil, TOKEN_INVALID end
 
   local header = cjson.decode(decode_base64url(header_segment) or "")
   local payload = cjson.decode(decode_base64url(payload_segment) or "")
@@ -56,22 +56,15 @@ end
 -- alg=none và HS256 phải chết ở đây: nếu để lọt, khoá công khai trong JWKS trở thành
 -- khoá HMAC và bất kỳ ai cũng ký được token hợp lệ (SEC-GW-03).
 function _M.check_algorithm(header, allowed_algorithms)
-  if type(header.alg) ~= "string" then
+  if type(header.alg) ~= "string" or not contains(allowed_algorithms, header.alg) then
     return nil, TOKEN_INVALID
   end
 
-  for _, algorithm in ipairs(allowed_algorithms) do
-    if header.alg == algorithm then
-      return true
-    end
-  end
-
-  return nil, TOKEN_INVALID
+  return true
 end
 
 function _M.verify_signature(public_key, parsed)
-  local verified = public_key:verify(parsed.signature, parsed.signing_input, "sha256")
-  if not verified then
+  if not public_key:verify(parsed.signature, parsed.signing_input, "sha256") then
     return nil, TOKEN_INVALID
   end
 
@@ -79,53 +72,26 @@ function _M.verify_signature(public_key, parsed)
 end
 
 local function audience_matches(claim, expected)
-  if type(claim) == "string" then
-    return claim == expected
-  end
+  if type(claim) == "string" then return claim == expected end
 
-  if type(claim) ~= "table" then
-    return false
-  end
-
-  for _, value in ipairs(claim) do
-    if value == expected then
-      return true
-    end
-  end
-
-  return false
+  return type(claim) == "table" and contains(claim, expected)
 end
 
 function _M.validate_claims(payload, config, now)
-  if payload.iss ~= config.issuer then
-    return nil, TOKEN_INVALID
-  end
-
-  if not audience_matches(payload.aud, config.audience) then
-    return nil, TOKEN_INVALID
-  end
-
-  if type(payload.sub) ~= "string" or payload.sub == "" then
-    return nil, TOKEN_INVALID
-  end
+  if payload.iss ~= config.issuer then return nil, TOKEN_INVALID end
+  if not audience_matches(payload.aud, config.audience) then return nil, TOKEN_INVALID end
+  if type(payload.sub) ~= "string" or payload.sub == "" then return nil, TOKEN_INVALID end
 
   local skew = config.clock_skew_seconds
 
   -- Thiếu exp là token sai định dạng, không phải hết hạn: hai mã lỗi này dẫn frontend
   -- tới hai hành vi khác nhau (đăng nhập lại vs báo lỗi phiên).
-  if type(payload.exp) ~= "number" then
-    return nil, TOKEN_INVALID
-  end
-
-  if payload.exp + skew <= now then
-    return nil, TOKEN_EXPIRED
-  end
+  if type(payload.exp) ~= "number" then return nil, TOKEN_INVALID end
+  if payload.exp + skew <= now then return nil, TOKEN_EXPIRED end
 
   -- iat ở tương lai quá clock skew nghĩa là đồng hồ lệch hoặc token bị chế; cả hai
   -- đều không nên cho qua.
-  if type(payload.iat) ~= "number" or payload.iat - skew > now then
-    return nil, TOKEN_INVALID
-  end
+  if type(payload.iat) ~= "number" or payload.iat - skew > now then return nil, TOKEN_INVALID end
 
   if payload.nbf ~= nil and (type(payload.nbf) ~= "number" or payload.nbf - skew > now) then
     return nil, TOKEN_INVALID
