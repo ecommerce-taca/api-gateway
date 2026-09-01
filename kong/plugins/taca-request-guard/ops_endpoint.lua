@@ -13,50 +13,29 @@ local DEGRADED = "DEGRADED"
 
 local _M = {}
 
-function _M.build_redis_client(config)
-  return redis_client.new({
-    host = config.redis.host,
-    port = config.redis.port,
-    database = config.redis.database,
-    password = config.redis.password,
-    timeout_ms = config.redis.timeout_ms,
-  })
-end
-
 -- Đọc trạng thái target qua API in-process của balancer — cùng nguồn mà plugin prometheus
 -- dùng cho kong_upstream_target_health. Không gọi Admin API lúc runtime (LLD §8 #18).
 function _M.read_upstream_health()
   local loaded, balancer = pcall(require, "kong.runloop.balancer")
-  if not loaded then
-    return nil
-  end
+  if not loaded then return nil end
 
   -- get_all_upstreams đã chuyển sang module con từ sau Kong 2.5; plugin prometheus của
   -- Kong cũng phải fallback đúng như vậy.
   local list_upstreams = balancer.get_all_upstreams
   if not list_upstreams then
     local submodule_loaded, upstreams_module = pcall(require, "kong.runloop.balancer.upstreams")
-    if not submodule_loaded then
-      return nil
-    end
+    if not submodule_loaded then return nil end
 
     list_upstreams = upstreams_module.get_all_upstreams
   end
 
   local upstreams = list_upstreams and list_upstreams()
-  if not upstreams then
-    return nil
-  end
+  if not upstreams then return nil end
 
   for _, upstream_id in pairs(upstreams) do
-    local health = balancer.get_upstream_health(upstream_id)
-    for _, target in pairs(health or {}) do
-      if target.addresses then
-        for _, address in ipairs(target.addresses) do
-          if address.health == "UNHEALTHY" then
-            return DEGRADED
-          end
-        end
+    for _, target in pairs(balancer.get_upstream_health(upstream_id) or {}) do
+      for _, address in ipairs(target.addresses or {}) do
+        if address.health == "UNHEALTHY" then return DEGRADED end
       end
     end
   end
@@ -69,19 +48,9 @@ function _M.now_iso8601()
 end
 
 local function check_jwks(config)
-  if not config.jwks or not config.jwks.jwks_uri then
-    return DOWN
-  end
+  if not config.jwks or not config.jwks.jwks_uri then return DOWN end
 
-  local loaded = jwks.ensure_loaded(config.jwks)
-
-  return loaded and UP or DOWN
-end
-
-local function check_redis(config)
-  local reachable = _M.build_redis_client(config):ping()
-
-  return reachable and UP or DOWN
+  return jwks.ensure_loaded(config.jwks) and UP or DOWN
 end
 
 -- Route này chỉ tồn tại khi declarative config đã nạp xong, nên chạy được tới đây
@@ -90,36 +59,25 @@ function _M.collect_checks(config)
   return {
     config = UP,
     jwks = check_jwks(config),
-    redis = check_redis(config),
+    redis = redis_client.new(config.redis):ping() and UP or DOWN,
     upstreams = _M.read_upstream_health() or DEGRADED,
   }
 end
 
 -- Mã lỗi tương ứng dependency hỏng đầu tiên, theo thứ tự ảnh hưởng (IT-GW-04..06).
 function _M.first_failure_code(checks)
-  if checks.config ~= UP then
-    return "GATEWAY_CONFIG_INVALID"
-  end
-
-  if checks.jwks ~= UP then
-    return "GATEWAY_JWKS_UNAVAILABLE"
-  end
-
-  if checks.redis ~= UP then
-    return "GATEWAY_REDIS_UNAVAILABLE"
-  end
+  if checks.config ~= UP then return "GATEWAY_CONFIG_INVALID" end
+  if checks.jwks ~= UP then return "GATEWAY_JWKS_UNAVAILABLE" end
+  if checks.redis ~= UP then return "GATEWAY_REDIS_UNAVAILABLE" end
 
   return nil
 end
 
 function _M.readiness_body(config, checks, trace_id)
-  local status = DEGRADED
-  if checks.upstreams == UP then
-    status = UP
-  end
-
   return {
-    status = status,
+    -- Upstream hỏng không làm gateway mất khả năng phục vụ: readiness vẫn 200 nhưng
+    -- trạng thái tổng là DEGRADED để bảng theo dõi thấy được (IT-GW-06).
+    status = checks.upstreams == UP and UP or DEGRADED,
     service = config.service_name,
     checks = checks,
     time = _M.now_iso8601(),

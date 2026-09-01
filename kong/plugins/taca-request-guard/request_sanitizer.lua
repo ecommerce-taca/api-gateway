@@ -7,6 +7,8 @@ local resty_string = require "resty.string"
 -- Charset an toàn của REQUEST_ID (LLD §4): chỉ chữ, số và . _ : -
 local REQUEST_ID_PATTERN = "^[A-Za-z0-9._:%-]+$"
 local FORWARDED_PREFIX = "x-forwarded-"
+-- Nibble biến thể của UUID phải nằm trong 8..b theo RFC 9562.
+local VARIANT_NIBBLES = "89ab"
 
 local _M = {}
 
@@ -16,21 +18,19 @@ function _M.generate_request_id()
   local milliseconds = math.floor(ngx.now() * 1000)
   local time_hex = string.format("%012x", milliseconds)
   local random_hex = resty_string.to_hex(resty_random.bytes(10, true))
+  local variant = math.fmod(milliseconds, 4) + 1
 
   return string.format("%s-%s-7%s-%s%s-%s",
                        string.sub(time_hex, 1, 8),
                        string.sub(time_hex, 9, 12),
                        string.sub(random_hex, 1, 3),
-                       -- Nibble biến thể phải nằm trong 8..b theo RFC 9562.
-                       string.sub("89ab", math.fmod(milliseconds, 4) + 1, math.fmod(milliseconds, 4) + 1),
+                       string.sub(VARIANT_NIBBLES, variant, variant),
                        string.sub(random_hex, 4, 6),
                        string.sub(random_hex, 7, 18))
 end
 
 function _M.is_valid_request_id(value, max_length)
-  if type(value) ~= "string" or value == "" or #value > max_length then
-    return false
-  end
+  if type(value) ~= "string" or value == "" or #value > max_length then return false end
 
   return string.match(value, REQUEST_ID_PATTERN) ~= nil
 end
@@ -45,15 +45,8 @@ function _M.resolve_request_id(config)
   return _M.generate_request_id(), true
 end
 
-local function matches_stripped_prefix(header_name, prefixes)
-  local lowered = string.lower(header_name)
-  for _, prefix in ipairs(prefixes) do
-    if string.sub(lowered, 1, #prefix) == string.lower(prefix) then
-      return true
-    end
-  end
-
-  return false
+local function has_prefix(value, prefix)
+  return string.sub(value, 1, #prefix) == string.lower(prefix)
 end
 
 -- Client tự gửi X-User-*/X-Auth-* là dấu hiệu cố leo thang quyền; xoá trước khi taca-jwt
@@ -62,10 +55,11 @@ function _M.strip_spoofed_headers(config, is_trusted_proxy)
   local stripped = {}
 
   for name in pairs(kong.request.get_headers()) do
-    local should_strip = matches_stripped_prefix(name, config.stripped_header_prefixes)
+    local lowered = string.lower(name)
+    local should_strip = not is_trusted_proxy and has_prefix(lowered, FORWARDED_PREFIX)
 
-    if not should_strip and not is_trusted_proxy then
-      should_strip = string.sub(string.lower(name), 1, #FORWARDED_PREFIX) == FORWARDED_PREFIX
+    for _, prefix in ipairs(config.stripped_header_prefixes) do
+      should_strip = should_strip or has_prefix(lowered, prefix)
     end
 
     if should_strip then
