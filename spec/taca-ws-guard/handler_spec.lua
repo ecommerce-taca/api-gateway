@@ -1,6 +1,7 @@
 local kong_stub = require "spec.helpers.kong_stub"
 local metrics_store = require "kong.plugins.taca-lib.metrics_store"
 local handler = require "kong.plugins.taca-ws-guard.handler"
+local redis_client = require "kong.plugins.taca-lib.redis_client"
 
 local function config(overrides)
   local value = {
@@ -29,7 +30,7 @@ describe("taca-ws-guard handler", function()
   local original_redis_builder, redis_calls
 
   setup(function()
-    original_redis_builder = handler.build_redis_client
+    original_redis_builder = redis_client.new
   end)
 
   before_each(function()
@@ -38,12 +39,12 @@ describe("taca-ws-guard handler", function()
   end)
 
   after_each(function()
-    handler.build_redis_client = original_redis_builder
+    redis_client.new = original_redis_builder
     kong_stub.uninstall()
   end)
 
   local function stub_redis(counter_value, error_code)
-    handler.build_redis_client = function()
+    redis_client.new = function()
       return {
         increment_with_expiry = function(_, key, ttl)
           redis_calls.increment = redis_calls.increment + 1

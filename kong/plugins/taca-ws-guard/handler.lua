@@ -18,16 +18,6 @@ local TacaWsGuardHandler = {
   VERSION = "1.0.0",
 }
 
-function TacaWsGuardHandler.build_redis_client(config)
-  return redis_client.new({
-    host = config.redis.host,
-    port = config.redis.port,
-    database = config.redis.database,
-    password = config.redis.password,
-    timeout_ms = config.redis.timeout_ms,
-  })
-end
-
 -- Key chứa hash chứ không chứa user_id thô: Redis dùng chung nhiều mục đích và
 -- không được chứa PII dạng đọc được (DB §5.2).
 local function connection_key(user_id)
@@ -39,12 +29,9 @@ end
 
 -- Chạy trong ngx.timer vì phase log của nginx không cho phép dùng cosocket.
 function TacaWsGuardHandler.release_connection(premature, config, key)
-  if premature then
-    return
-  end
+  if premature then return end
 
-  local client = TacaWsGuardHandler.build_redis_client(config)
-  local remaining, error_code = client:decrement(key)
+  local remaining, error_code = redis_client.new(config.redis):decrement(key)
   if remaining == nil then
     -- Không có gì để làm ngoài ghi log: counter còn TTL nên sẽ tự dọn.
     kong.log.warn("ws connection counter release failed: ", error_code)
@@ -62,7 +49,7 @@ function TacaWsGuardHandler:access(config)
   end
 
   local key = connection_key(actor.user_id)
-  local client = TacaWsGuardHandler.build_redis_client(config)
+  local client = redis_client.new(config.redis)
 
   local opened, error_code = client:increment_with_expiry(key, config.connection_counter_ttl_seconds)
   if opened == nil then
@@ -87,9 +74,7 @@ end
 -- điểm cần giảm counter, không phải lúc handshake xong.
 function TacaWsGuardHandler:log(config)
   local key = kong.ctx.shared.taca_ws_connection_key
-  if not key then
-    return
-  end
+  if not key then return end
 
   local scheduled, err = ngx.timer.at(0, TacaWsGuardHandler.release_connection, config, key)
   if not scheduled then
