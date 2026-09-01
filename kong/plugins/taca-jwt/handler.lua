@@ -17,63 +17,36 @@ local TacaJwtHandler = {
   VERSION = "1.0.0",
 }
 
--- Tách riêng để test được không cần Redis thật; runtime luôn dùng adapter mặc định.
-function TacaJwtHandler.build_redis_client(config)
-  return redis_client.new({
-    host = config.redis.host,
-    port = config.redis.port,
-    database = config.redis.database,
-    password = config.redis.password,
-    timeout_ms = config.redis.timeout_ms,
-  })
-end
-
 -- Auth User đẩy marker khi suspend/revoke user (DB §3.1.2). Redis lỗi thì fail-closed:
 -- cho qua nghĩa là user vừa bị khoá vẫn dùng được tiếp cho tới khi access token hết hạn.
 local function is_revoked(config, user_id)
-  if not config.revocation_check_enabled then
-    return false
-  end
+  if not config.revocation_check_enabled then return false end
 
-  local client = TacaJwtHandler.build_redis_client(config)
+  local client = redis_client.new(config.redis)
   local exists, error_code = client:key_exists(REVOKED_KEY_PREFIX .. user_id)
-  if exists == nil then
-    return nil, error_code
-  end
+  if exists == nil then return nil, error_code end
 
   return exists
 end
 
 local function verify_token(config, token)
   local parsed, parse_error = token_verifier.parse(token)
-  if not parsed then
-    return nil, parse_error
-  end
+  if not parsed then return nil, parse_error end
 
   local algorithm_ok, algorithm_error =
     token_verifier.check_algorithm(parsed.header, config.allowed_algorithms)
-  if not algorithm_ok then
-    return nil, algorithm_error
-  end
+  if not algorithm_ok then return nil, algorithm_error end
 
-  if type(parsed.header.kid) ~= "string" then
-    return nil, "GATEWAY_TOKEN_INVALID"
-  end
+  if type(parsed.header.kid) ~= "string" then return nil, "GATEWAY_TOKEN_INVALID" end
 
   local public_key, key_error = jwks.get_public_key(config, parsed.header.kid)
-  if not public_key then
-    return nil, key_error
-  end
+  if not public_key then return nil, key_error end
 
   local signature_ok, signature_error = token_verifier.verify_signature(public_key, parsed)
-  if not signature_ok then
-    return nil, signature_error
-  end
+  if not signature_ok then return nil, signature_error end
 
   local claims_ok, claims_error = token_verifier.validate_claims(parsed.payload, config, ngx.time())
-  if not claims_ok then
-    return nil, claims_error
-  end
+  if not claims_ok then return nil, claims_error end
 
   return parsed.payload
 end
@@ -89,23 +62,15 @@ function TacaJwtHandler:access(config)
   end
 
   local payload, verify_error = verify_token(config, token)
-  if not payload then
-    return envelope_builder.exit(verify_error)
-  end
+  if not payload then return envelope_builder.exit(verify_error) end
 
   local revoked, revocation_error = is_revoked(config, payload.sub)
-  if revoked == nil then
-    return envelope_builder.exit(revocation_error)
-  end
-
-  if revoked then
-    return envelope_builder.exit("GATEWAY_TOKEN_INVALID")
-  end
-
-  local actor = actor_context.build(payload)
-  actor_context.apply(actor)
+  if revoked == nil then return envelope_builder.exit(revocation_error) end
+  if revoked then return envelope_builder.exit("GATEWAY_TOKEN_INVALID") end
 
   -- taca-rbac và taca-ws-guard đọc lại actor ở đây thay vì parse token lần nữa.
+  local actor = actor_context.build(payload)
+  actor_context.apply(actor)
   kong.ctx.shared.taca_actor = actor
 end
 

@@ -35,9 +35,7 @@ _M.states = {
 -- runtime giữ nguyên implementation dưới đây.
 function _M.fetch_jwks(config)
   local client, err = http.new()
-  if not client then
-    return nil, err
-  end
+  if not client then return nil, err end
 
   client:set_timeout(config.jwks_request_timeout_ms)
 
@@ -45,10 +43,7 @@ function _M.fetch_jwks(config)
     method = "GET",
     headers = { ["Accept"] = "application/json" },
   })
-  if not response then
-    return nil, request_err
-  end
-
+  if not response then return nil, request_err end
   if response.status ~= 200 then
     return nil, "jwks endpoint returned status " .. response.status
   end
@@ -77,7 +72,9 @@ local function write_keys(store, document, ttl_seconds)
   for _, jwk in ipairs(document.keys) do
     if is_signing_key(jwk) then
       local key, parse_err = pkey.new(cjson.encode(jwk), { format = "JWK" })
-      if key then
+      if not key then
+        kong.log.warn("skipping unusable jwk kid=", jwk.kid, " err=", parse_err)
+      else
         -- Giữ TTL dài hơn max_stale để bản thân key không biến mất trước khi
         -- logic stale kịp quyết định; hạn dùng do loaded_at quyết định, không do TTL.
         local stored, store_err, forcible = store:set(KEY_PREFIX .. jwk.kid,
@@ -91,8 +88,6 @@ local function write_keys(store, document, ttl_seconds)
         end
 
         written = written + 1
-      else
-        kong.log.warn("skipping unusable jwk kid=", jwk.kid, " err=", parse_err)
       end
     end
   end
@@ -100,24 +95,23 @@ local function write_keys(store, document, ttl_seconds)
   return written
 end
 
+local function refresh_failed(reason, err)
+  metrics_store.increment(METRIC_NAME, { outcome = "failure" })
+  kong.log.err(reason, err)
+
+  return nil, JWKS_UNAVAILABLE
+end
+
 local function refresh_now(config)
   local store = store_of(config)
-  if not store then
-    return nil, JWKS_UNAVAILABLE
-  end
+  if not store then return nil, JWKS_UNAVAILABLE end
 
   local document, fetch_err = _M.fetch_jwks(config)
-  if not document then
-    metrics_store.increment(METRIC_NAME, { outcome = "failure" })
-    kong.log.err("jwks refresh failed: ", fetch_err)
-    return nil, JWKS_UNAVAILABLE
-  end
+  if not document then return refresh_failed("jwks refresh failed: ", fetch_err) end
 
   local written, write_err = write_keys(store, document, config.jwks_max_stale_seconds * 2)
   if not written then
-    metrics_store.increment(METRIC_NAME, { outcome = "failure" })
-    kong.log.err("jwks shared dict write failed: ", write_err)
-    return nil, JWKS_UNAVAILABLE
+    return refresh_failed("jwks shared dict write failed: ", write_err)
   end
 
   store:set(LOADED_AT_KEY, ngx.time())
@@ -129,9 +123,10 @@ end
 -- Refresh một lần dưới lock: nhiều request cùng gặp kid lạ sẽ chờ trên lock thay vì
 -- mỗi request bắn một lời gọi tới auth-user (LLD §2.4 bước 3, RES-GW-02).
 local function refresh_single_flight(config)
+  local timeout_seconds = config.jwks_request_timeout_ms / 1000
   local lock, lock_err = resty_lock:new(config.lock_shared_dict, {
-    timeout = config.jwks_request_timeout_ms / 1000,
-    exptime = (config.jwks_request_timeout_ms / 1000) * 2,
+    timeout = timeout_seconds,
+    exptime = timeout_seconds * 2,
   })
   if not lock then
     kong.log.err("cannot create jwks refresh lock: ", lock_err)
@@ -139,16 +134,12 @@ local function refresh_single_flight(config)
   end
 
   local elapsed = lock:lock(LOCK_KEY)
-  if not elapsed then
-    return nil, JWKS_UNAVAILABLE
-  end
+  if not elapsed then return nil, JWKS_UNAVAILABLE end
 
   -- elapsed > 0 nghĩa là đã chờ người khác refresh xong; đọc lại cache trước khi
   -- tự gọi lần nữa.
-  local result, err
-  if elapsed > 0 then
-    result = true
-  else
+  local result, err = true, nil
+  if elapsed == 0 then
     result, err = refresh_now(config)
   end
 
@@ -159,24 +150,14 @@ end
 
 local function read_key(config, kid)
   local cached = parsed_keys:get(kid)
-  if cached then
-    return cached
-  end
+  if cached then return cached end
 
   local store = store_of(config)
-  if not store then
-    return nil
-  end
-
-  local pem = store:get(KEY_PREFIX .. kid)
-  if not pem then
-    return nil
-  end
+  local pem = store and store:get(KEY_PREFIX .. kid)
+  if not pem then return nil end
 
   local key = pkey.new(pem)
-  if not key then
-    return nil
-  end
+  if not key then return nil end
 
   parsed_keys:set(kid, key)
 
@@ -185,31 +166,16 @@ end
 
 local function loaded_age(config)
   local store = store_of(config)
-  if not store then
-    return nil
-  end
-
-  local loaded_at = store:get(LOADED_AT_KEY)
-  if not loaded_at then
-    return nil
-  end
+  local loaded_at = store and store:get(LOADED_AT_KEY)
+  if not loaded_at then return nil end
 
   return ngx.time() - loaded_at, loaded_at
 end
 
 function _M.state(config)
   local age = loaded_age(config)
-  if not age then
-    return _M.states.UNAVAILABLE
-  end
-
-  if age > config.jwks_max_stale_seconds then
-    return _M.states.UNAVAILABLE
-  end
-
-  if age > config.jwks_ttl_seconds then
-    return _M.states.STALE
-  end
+  if not age or age > config.jwks_max_stale_seconds then return _M.states.UNAVAILABLE end
+  if age > config.jwks_ttl_seconds then return _M.states.STALE end
 
   return _M.states.AVAILABLE
 end
@@ -220,46 +186,35 @@ function _M.get_public_key(config, kid)
 
   if state == _M.states.AVAILABLE then
     local key = read_key(config, kid)
-    if key then
-      return key
-    end
+    if key then return key end
   end
 
   local refreshed, refresh_err = refresh_single_flight(config)
   if not refreshed then
     -- Còn trong cửa sổ stale thì vẫn dùng key đã biết, nhưng phải ghi metric
     -- để vận hành thấy JWKS đang hỏng trước khi nó vượt max_stale (LLD §5.3).
-    if state == _M.states.STALE then
-      local key = read_key(config, kid)
-      if key then
-        metrics_store.increment(METRIC_NAME, { outcome = "stale" })
-        return key
-      end
+    local key = state == _M.states.STALE and read_key(config, kid)
+    if key then
+      metrics_store.increment(METRIC_NAME, { outcome = "stale" })
+      return key
     end
 
     return nil, refresh_err or JWKS_UNAVAILABLE
   end
 
   local key = read_key(config, kid)
-  if not key then
-    -- Refresh thành công mà vẫn không có kid: token không do issuer này ký.
-    return nil, TOKEN_INVALID
-  end
+  -- Refresh thành công mà vẫn không có kid: token không do issuer này ký.
+  if not key then return nil, TOKEN_INVALID end
 
   return key
 end
 
 -- Dùng cho readiness (DB §6: JWKS bootstrap khi startup/readiness).
 function _M.ensure_loaded(config)
-  local state = _M.state(config)
-  if state == _M.states.AVAILABLE then
-    return true
-  end
+  if _M.state(config) == _M.states.AVAILABLE then return true end
 
   local refreshed, err = refresh_single_flight(config)
-  if not refreshed then
-    return nil, err or JWKS_UNAVAILABLE
-  end
+  if not refreshed then return nil, err or JWKS_UNAVAILABLE end
 
   return true
 end
