@@ -30,57 +30,46 @@ local _M = {}
 local function looks_internal(value)
   local lowered = string.lower(value)
   for _, pattern in ipairs(INTERNAL_LEAK_PATTERNS) do
-    if string.find(lowered, pattern) then
-      return true
-    end
+    if string.find(lowered, pattern) then return true end
   end
 
   return false
 end
 
+-- Body không phải JSON envelope thì không có gì để giữ lại.
+local function decode_envelope(raw_body)
+  local document = cjson.decode(raw_body or "")
+  if type(document) ~= "table" or type(document.error) ~= "table" then return nil end
+
+  return document.error, document
+end
+
 local function is_allowed_code(code, allowlist)
-  if type(code) ~= "string" or #code > MAX_CODE_LENGTH then
-    return false
-  end
-
-  if not string.match(code, BUSINESS_CODE_PATTERN) then
-    return false
-  end
-
-  if #allowlist == 0 then
-    return true
-  end
+  if type(code) ~= "string" or #code > MAX_CODE_LENGTH then return false end
+  if not string.match(code, BUSINESS_CODE_PATTERN) then return false end
+  if #allowlist == 0 then return true end
 
   for _, allowed in ipairs(allowlist) do
-    if allowed == code then
-      return true
-    end
+    if allowed == code then return true end
   end
 
   return false
 end
 
 local function sanitize_details(details)
-  if type(details) ~= "table" then
-    return cjson.empty_array
-  end
+  if type(details) ~= "table" then return cjson.empty_array end
 
   local safe = {}
   local has_field = false
   for name, value in pairs(details) do
-    if type(value) == "string" and looks_internal(value) then
-      safe[name] = nil
-    elseif type(value) == "string" or type(value) == "number" or type(value) == "boolean" then
+    local kind = type(value)
+    if (kind == "string" and not looks_internal(value)) or kind == "number" or kind == "boolean" then
       safe[name] = value
       has_field = true
     end
   end
 
-  if not has_field then
-    return cjson.empty_array
-  end
-
-  return safe
+  return has_field and safe or cjson.empty_array
 end
 
 local function sanitize_message(message)
@@ -93,20 +82,11 @@ end
 
 -- Trả về body đã hợp lệ hoá, hoặc nil nếu upstream không tuân contract envelope.
 function _M.keep_business_error(raw_body, allowlist, trace_id)
-  local document = cjson.decode(raw_body or "")
-  if type(document) ~= "table" or type(document.error) ~= "table" then
-    return nil
-  end
-
-  local upstream_error = document.error
-  if not is_allowed_code(upstream_error.code, allowlist) then
-    return nil
-  end
+  local upstream_error = decode_envelope(raw_body)
+  if not upstream_error or not is_allowed_code(upstream_error.code, allowlist) then return nil end
 
   local message = sanitize_message(upstream_error.message)
-  if not message then
-    return nil
-  end
+  if not message then return nil end
 
   return cjson.encode({
     error = {
@@ -123,19 +103,10 @@ end
 -- theo status sẽ ghi đè chúng: 401 GATEWAY_TOKEN_EXPIRED biến thành GATEWAY_INVALID_REQUEST
 -- và frontend mất khả năng phân biệt hết hạn với sai định dạng.
 function _M.keep_gateway_envelope(raw_body, trace_id)
-  local document = cjson.decode(raw_body or "")
-  if type(document) ~= "table" or type(document.error) ~= "table" then
-    return nil
-  end
+  local gateway_error, document = decode_envelope(raw_body)
+  if not gateway_error or not error_catalog.is_known(gateway_error.code) then return nil end
 
-  if not error_catalog.is_known(document.error.code) then
-    return nil
-  end
-
-  local gateway_error = document.error
-  if gateway_error.trace_id and gateway_error.trace_id ~= "" then
-    return raw_body
-  end
+  if gateway_error.trace_id and gateway_error.trace_id ~= "" then return raw_body end
 
   gateway_error.trace_id = trace_id
 

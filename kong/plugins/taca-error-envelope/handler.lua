@@ -6,7 +6,6 @@ local body_rewriter = require "kong.plugins.taca-error-envelope.body_rewriter"
 local envelope_builder = require "kong.plugins.taca-lib.envelope_builder"
 local error_mapper = require "kong.plugins.taca-error-envelope.error_mapper"
 
-local JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 local WEBSOCKET_SWITCHING_PROTOCOLS = 101
 
 local TacaErrorEnvelopeHandler = {
@@ -27,9 +26,7 @@ function TacaErrorEnvelopeHandler:header_filter(config)
 
   -- Response thành công và connection đã upgrade lên WebSocket không bao giờ bị đụng:
   -- ghi vào một connection đang ở chế độ tunnel sẽ làm hỏng frame (LLD §3.9).
-  if status < 400 or status == WEBSOCKET_SWITCHING_PROTOCOLS then
-    return
-  end
+  if status < 400 or status == WEBSOCKET_SWITCHING_PROTOCOLS then return end
 
   local plan = error_mapper.plan(config,
                                  kong.response.get_source(),
@@ -51,7 +48,7 @@ function TacaErrorEnvelopeHandler:header_filter(config)
     kong.response.set_status(plan.status)
   end
 
-  kong.response.set_header("Content-Type", JSON_CONTENT_TYPE)
+  kong.response.set_header("Content-Type", envelope_builder.JSON_CONTENT_TYPE)
   -- Body luôn bị viết lại nên độ dài cũ không còn đúng.
   kong.response.clear_header("Content-Length")
 end
@@ -61,28 +58,20 @@ local function final_body(config, plan, raw_body)
     local kept = body_rewriter.keep_business_error(raw_body,
                                                    config.allowed_business_error_codes,
                                                    plan.trace_id)
-    if kept then
-      return kept
-    end
+    if kept then return kept end
 
     kong.log.warn("upstream 4xx body does not follow the error envelope contract")
 
     return body_rewriter.gateway_error("GATEWAY_UPSTREAM_BAD_RESPONSE", nil, plan.trace_id)
   end
 
-  local already_normalized = body_rewriter.keep_gateway_envelope(raw_body, plan.trace_id)
-  if already_normalized then
-    return already_normalized
-  end
-
-  return body_rewriter.gateway_error(plan.code, plan.details, plan.trace_id)
+  return body_rewriter.keep_gateway_envelope(raw_body, plan.trace_id)
+      or body_rewriter.gateway_error(plan.code, plan.details, plan.trace_id)
 end
 
 function TacaErrorEnvelopeHandler:body_filter(config)
   local plan = kong.ctx.shared.taca_envelope_plan
-  if not plan then
-    return
-  end
+  if not plan then return end
 
   local buffer = kong.ctx.shared.taca_envelope_buffer
   local chunk = ngx.arg[1]
