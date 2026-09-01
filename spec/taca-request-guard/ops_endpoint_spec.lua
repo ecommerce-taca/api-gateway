@@ -3,6 +3,7 @@ local kong_stub = require "spec.helpers.kong_stub"
 local jwt_fixture = require "spec.helpers.jwt_fixture"
 local jwks = require "kong.plugins.taca-jwt.jwks"
 local ops_endpoint = require "kong.plugins.taca-request-guard.ops_endpoint"
+local redis_client = require "kong.plugins.taca-lib.redis_client"
 
 local function config(overrides)
   local value = {
@@ -31,7 +32,7 @@ describe("taca-request-guard ops_endpoint", function()
   setup(function()
     signing_key = jwt_fixture.new_key("key-01")
     original_fetcher = jwks.fetch_jwks
-    original_redis_builder = ops_endpoint.build_redis_client
+    original_redis_builder = redis_client.new
     original_upstream_reader = ops_endpoint.read_upstream_health
   end)
 
@@ -43,7 +44,7 @@ describe("taca-request-guard ops_endpoint", function()
 
   after_each(function()
     jwks.fetch_jwks = original_fetcher
-    ops_endpoint.build_redis_client = original_redis_builder
+    redis_client.new = original_redis_builder
     ops_endpoint.read_upstream_health = original_upstream_reader
     kong_stub.uninstall()
   end)
@@ -57,7 +58,7 @@ describe("taca-request-guard ops_endpoint", function()
       return jwt_fixture.jwks_document({ signing_key })
     end
 
-    ops_endpoint.build_redis_client = function()
+    redis_client.new = function()
       return {
         ping = function()
           if options.redis_up == false then

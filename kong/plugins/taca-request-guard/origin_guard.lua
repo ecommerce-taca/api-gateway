@@ -8,19 +8,11 @@ local _M = {}
 
 function _M.is_allowed(origin, allowed_origins)
   -- Không có Origin nghĩa là request không đến từ trình duyệt (server-to-server, curl,
-  -- webhook đối tác); CORS không áp dụng cho nhóm này.
-  if not origin then
-    return true
-  end
-
-  if #allowed_origins == 0 then
-    return true
-  end
+  -- webhook đối tác); CORS không áp dụng cho nhóm này. Allowlist rỗng = chưa cấu hình.
+  if not origin or #allowed_origins == 0 then return true end
 
   for _, allowed in ipairs(allowed_origins) do
-    if allowed == WILDCARD or allowed == origin then
-      return true
-    end
+    if allowed == WILDCARD or allowed == origin then return true end
   end
 
   return false

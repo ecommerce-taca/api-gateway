@@ -1,6 +1,7 @@
 -- Cấu hình taca-request-guard (LLD §2.1.2, §2.1.5, §4.1).
 
 local typedefs = require "kong.db.schema.typedefs"
+local redis_field = require "kong.plugins.taca-lib.schema_redis"
 
 return {
   name = "taca-request-guard",
@@ -48,18 +49,7 @@ return {
               },
             },
           },
-          {
-            redis = {
-              type = "record",
-              fields = {
-                { host = { type = "string", default = "127.0.0.1" } },
-                { port = { type = "integer", default = 6379 } },
-                { database = { type = "integer", default = 0 } },
-                { password = { type = "string", encrypted = true } },
-                { timeout_ms = { type = "number", default = 500 } },
-              },
-            },
-          },
+          redis_field(),
         },
       },
     },
