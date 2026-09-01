@@ -61,37 +61,20 @@ local function series_key(metric_name, label_values)
   return string.format("%s{%s}", metric_name, table.concat(parts, ","))
 end
 
-function _M.increment(metric_name, label_values)
+-- init=0 để lần đếm đầu tiên không cần đọc-ghi hai bước và không mất counter khi đua.
+local function add(key, delta)
   local store = dict()
-  if not store then
-    return
+  if store and key then
+    store:incr(key, delta, 0)
   end
-
-  local key = series_key(metric_name, label_values)
-  if not key then
-    return
-  end
-
-  -- init=0 để lần đếm đầu tiên không cần đọc-ghi hai bước và không mất counter khi đua.
-  store:incr(key, 1, 0)
 end
 
-function _M.set_gauge(metric_name, value)
-  local store = dict()
-  if not store then
-    return
-  end
-
-  store:set(metric_name, value)
+function _M.increment(metric_name, label_values)
+  add(series_key(metric_name, label_values), 1)
 end
 
 function _M.add_to_gauge(metric_name, delta)
-  local store = dict()
-  if not store then
-    return
-  end
-
-  store:incr(metric_name, delta, 0)
+  add(metric_name, delta)
 end
 
 -- Sinh đoạn text OpenMetrics để ghép vào body /metrics của plugin prometheus.
@@ -101,10 +84,12 @@ function _M.render()
     return ""
   end
 
+  local keys = store:get_keys(0)
   local lines = {}
+
   for metric_name, definition in pairs(METRIC_DEFINITIONS) do
     local series = {}
-    for _, key in ipairs(store:get_keys(0)) do
+    for _, key in ipairs(keys) do
       if key == metric_name or key:sub(1, #metric_name + 1) == metric_name .. "{" then
         series[#series + 1] = string.format("%s %s", key, store:get(key) or 0)
       end
@@ -119,11 +104,7 @@ function _M.render()
     end
   end
 
-  if #lines == 0 then
-    return ""
-  end
-
-  return table.concat(lines, "\n") .. "\n"
+  return #lines > 0 and table.concat(lines, "\n") .. "\n" or ""
 end
 
 function _M.reset()

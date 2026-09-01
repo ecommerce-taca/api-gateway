@@ -35,7 +35,7 @@ describe("metrics_store", function()
   end)
 
   it("should render a gauge without labels", function()
-    metrics_store.set_gauge("taca_ws_connections", 3)
+    metrics_store.add_to_gauge("taca_ws_connections", 3)
 
     local rendered = metrics_store.render()
 
