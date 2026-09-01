@@ -46,107 +46,26 @@ def plugin_map(entity: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {plugin["name"]: plugin.get("config") or {} for plugin in entity.get("plugins") or []}
 
 
-def iter_routes(config: dict[str, Any]) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
-    for service in config.get("services") or []:
-        for route in service.get("routes") or []:
-            yield service, route
+def iter_services(config) -> Iterator[dict[str, Any]]:
+    return iter(config.get("services") or [])
 
 
-def route_paths(route: dict[str, Any]) -> list[str]:
-    return route.get("paths") or []
+def iter_routes(config) -> Iterator[dict[str, Any]]:
+    for service in iter_services(config):
+        yield from service.get("routes") or []
 
 
-def is_business_route(route: dict[str, Any]) -> bool:
-    return any(path.lstrip("~").startswith((API_PREFIX, "/ws/")) for path in route_paths(route))
+def iter_route_paths(config) -> Iterator[tuple[dict[str, Any], str]]:
+    for route in iter_routes(config):
+        for path in route.get("paths") or []:
+            yield route, path
 
 
-def check_write_services_never_retry(config) -> list[Violation]:
-    violations = []
-    for service in config.get("services") or []:
-        name = service["name"]
-        expects_zero = name.endswith("-write") or name == "svc-message-ws"
-        if expects_zero and service.get("retries") != 0:
-            violations.append(Violation(
-                "R01", name,
-                f"retries={service.get('retries')} — mutation và handshake WebSocket "
-                "không bao giờ được retry"))
-    return violations
-
-
-def check_read_services_retry_at_most_once(config) -> list[Violation]:
-    violations = []
-    for service in config.get("services") or []:
-        name = service["name"]
-        if name.endswith("-read") and (service.get("retries") or 0) > 1:
-            violations.append(Violation(
-                "R02", name, f"retries={service.get('retries')} — policy cho phép tối đa 1 lần"))
-    return violations
-
-
-def check_admin_routes_are_gated(config) -> list[Violation]:
-    violations = []
-    for _, route in iter_routes(config):
-        admin_paths = [path for path in route_paths(route) if f"{API_PREFIX}/admin" in path]
-        if admin_paths and "taca-rbac" not in plugin_map(route):
-            violations.append(Violation(
-                "R03", route["name"], "route /admin/** thiếu taca-rbac — mất coarse gate admin"))
-    return violations
-
-
-def check_protected_routes_have_jwt(config) -> list[Violation]:
-    violations = []
-    for _, route in iter_routes(config):
-        plugins = plugin_map(route)
-        rate_limit = plugins.get("rate-limiting") or {}
-        needs_actor = (
-            "taca-rbac" in plugins
-            or "taca-ws-guard" in plugins
-            or rate_limit.get("limit_by") == "header"
-        )
-        if needs_actor and "taca-jwt" not in plugins:
-            violations.append(Violation(
-                "R04", route["name"],
-                "route cần danh tính (rbac/ws-guard/bucket theo user) nhưng thiếu taca-jwt"))
-    return violations
-
-
-def check_no_catch_all_route(config) -> list[Violation]:
-    violations = []
-    for _, route in iter_routes(config):
-        for path in route_paths(route):
-            if path in CATCH_ALL_PATHS:
-                violations.append(Violation(
-                    "R05", route["name"],
-                    f"path '{path}' là catch-all — nó nuốt mọi request và vô hiệu hoá "
-                    "gate theo từng nhánh"))
-    return violations
-
-
-def check_no_internal_route(config) -> list[Violation]:
-    violations = []
-    for _, route in iter_routes(config):
-        for path in route_paths(route):
-            if "/internal" in path:
-                violations.append(Violation(
-                    "R06", route["name"], f"path '{path}' expose nhánh /internal/**"))
-    return violations
-
-
-def check_single_websocket_path(config) -> list[Violation]:
-    violations = []
-    for _, route in iter_routes(config):
-        for path in route_paths(route):
-            if path.lstrip("~").startswith("/ws") and path != WEBSOCKET_PATH:
-                violations.append(Violation(
-                    "R07", route["name"],
-                    f"path '{path}' — chỉ {WEBSOCKET_PATH} được phép upgrade"))
-    return violations
-
-
-def _iter_plugin_instances(config) -> Iterator[tuple[str, str, dict[str, Any]]]:
+# Mọi instance plugin, dù khai báo ở global, service hay route.
+def iter_plugins(config) -> Iterator[tuple[str, str, dict[str, Any]]]:
     for plugin in config.get("plugins") or []:
         yield "global", plugin["name"], plugin.get("config") or {}
-    for service in config.get("services") or []:
+    for service in iter_services(config):
         for plugin in service.get("plugins") or []:
             yield service["name"], plugin["name"], plugin.get("config") or {}
         for route in service.get("routes") or []:
@@ -154,65 +73,120 @@ def _iter_plugin_instances(config) -> Iterator[tuple[str, str, dict[str, Any]]]:
                 yield route["name"], plugin["name"], plugin.get("config") or {}
 
 
-def check_rate_limiting_fails_closed(config) -> list[Violation]:
-    violations = []
-    for where, name, plugin_config in _iter_plugin_instances(config):
+def check_write_services_never_retry(config) -> Iterator[Violation]:
+    for service in iter_services(config):
+        name = service["name"]
+        if (name.endswith("-write") or name == "svc-message-ws") and service.get("retries") != 0:
+            yield Violation(
+                "R01", name,
+                f"retries={service.get('retries')} — mutation và handshake WebSocket "
+                "không bao giờ được retry")
+
+
+def check_read_services_retry_at_most_once(config) -> Iterator[Violation]:
+    for service in iter_services(config):
+        name = service["name"]
+        if name.endswith("-read") and (service.get("retries") or 0) > 1:
+            yield Violation(
+                "R02", name, f"retries={service.get('retries')} — policy cho phép tối đa 1 lần")
+
+
+def check_admin_routes_are_gated(config) -> Iterator[Violation]:
+    for route in iter_routes(config):
+        admin = any(f"{API_PREFIX}/admin" in path for path in route.get("paths") or [])
+        if admin and "taca-rbac" not in plugin_map(route):
+            yield Violation(
+                "R03", route["name"], "route /admin/** thiếu taca-rbac — mất coarse gate admin")
+
+
+def check_protected_routes_have_jwt(config) -> Iterator[Violation]:
+    for route in iter_routes(config):
+        plugins = plugin_map(route)
+        needs_actor = (
+            "taca-rbac" in plugins
+            or "taca-ws-guard" in plugins
+            or (plugins.get("rate-limiting") or {}).get("limit_by") == "header"
+        )
+        if needs_actor and "taca-jwt" not in plugins:
+            yield Violation(
+                "R04", route["name"],
+                "route cần danh tính (rbac/ws-guard/bucket theo user) nhưng thiếu taca-jwt")
+
+
+def check_no_catch_all_route(config) -> Iterator[Violation]:
+    for route, path in iter_route_paths(config):
+        if path in CATCH_ALL_PATHS:
+            yield Violation(
+                "R05", route["name"],
+                f"path '{path}' là catch-all — nó nuốt mọi request và vô hiệu hoá "
+                "gate theo từng nhánh")
+
+
+def check_no_internal_route(config) -> Iterator[Violation]:
+    for route, path in iter_route_paths(config):
+        if "/internal" in path:
+            yield Violation("R06", route["name"], f"path '{path}' expose nhánh /internal/**")
+
+
+def check_single_websocket_path(config) -> Iterator[Violation]:
+    for route, path in iter_route_paths(config):
+        if path.lstrip("~").startswith("/ws") and path != WEBSOCKET_PATH:
+            yield Violation(
+                "R07", route["name"], f"path '{path}' — chỉ {WEBSOCKET_PATH} được phép upgrade")
+
+
+def check_rate_limiting_fails_closed(config) -> Iterator[Violation]:
+    for where, name, plugin_config in iter_plugins(config):
         if name != "rate-limiting":
             continue
         if plugin_config.get("policy") != "redis":
-            violations.append(Violation(
+            yield Violation(
                 "R08", where,
                 f"policy={plugin_config.get('policy')} — local đếm riêng từng node nên "
-                "tổng limit sai gấp N lần số node"))
+                "tổng limit sai gấp N lần số node")
         if plugin_config.get("fault_tolerant") is not False:
-            violations.append(Violation(
+            yield Violation(
                 "R08", where,
                 "fault_tolerant khác false — mặc định của Kong cho request đi qua khi "
-                "Redis lỗi, vi phạm policy fail-closed"))
-    return violations
+                "Redis lỗi, vi phạm policy fail-closed")
 
 
-def check_origin_lists_match(config) -> list[Violation]:
+def check_origin_lists_match(config) -> Iterator[Violation]:
     cors_origins, guard_origins = None, None
-    for _, name, plugin_config in _iter_plugin_instances(config):
+    for _, name, plugin_config in iter_plugins(config):
         if name == "cors":
             cors_origins = plugin_config.get("origins")
         elif name == "taca-request-guard" and plugin_config.get("mode", "proxy") == "proxy":
             guard_origins = plugin_config.get("allowed_origins")
 
     if cors_origins is None or guard_origins is None:
-        return [Violation("R09", "global", "thiếu cors hoặc taca-request-guard chế độ proxy")]
-
-    if sorted(cors_origins) != sorted(guard_origins):
-        return [Violation(
+        yield Violation("R09", "global", "thiếu cors hoặc taca-request-guard chế độ proxy")
+    elif sorted(cors_origins) != sorted(guard_origins):
+        yield Violation(
             "R09", "global",
             f"cors.origins={cors_origins} lệch taca-request-guard.allowed_origins="
-            f"{guard_origins} — hai danh sách phải sinh từ một nguồn")]
-
-    return []
+            f"{guard_origins} — hai danh sách phải sinh từ một nguồn")
 
 
-def check_business_routes_keep_path(config) -> list[Violation]:
-    violations = []
-    for _, route in iter_routes(config):
-        if is_business_route(route) and route.get("strip_path") is not False:
-            violations.append(Violation(
+def check_business_routes_keep_path(config) -> Iterator[Violation]:
+    for route in iter_routes(config):
+        business = any(path.lstrip("~").startswith((API_PREFIX, "/ws/"))
+                       for path in route.get("paths") or [])
+        if business and route.get("strip_path") is not False:
+            yield Violation(
                 "R10", route["name"],
-                "strip_path phải là false — service đích nhận nguyên /api/v1/..."))
-    return violations
+                "strip_path phải là false — service đích nhận nguyên /api/v1/...")
 
 
-def check_websocket_route_has_no_body_plugin(config) -> list[Violation]:
-    violations = []
-    for _, route in iter_routes(config):
-        if WEBSOCKET_PATH not in route_paths(route):
+def check_websocket_route_has_no_body_plugin(config) -> Iterator[Violation]:
+    for route in iter_routes(config):
+        if WEBSOCKET_PATH not in (route.get("paths") or []):
             continue
         for name in plugin_map(route):
             if name in BODY_TOUCHING_PLUGINS:
-                violations.append(Violation(
+                yield Violation(
                     "R11", route["name"],
-                    f"plugin '{name}' đọc/ghi body — làm hỏng frame sau khi upgrade"))
-    return violations
+                    f"plugin '{name}' đọc/ghi body — làm hỏng frame sau khi upgrade")
 
 
 def _walk_config(value: Any, path: str) -> Iterator[tuple[str, str, Any]]:
@@ -226,15 +200,13 @@ def _walk_config(value: Any, path: str) -> Iterator[tuple[str, str, Any]]:
         yield path, path.split(".")[-1], value
 
 
-def check_no_hardcoded_secret(config) -> list[Violation]:
-    violations = []
+def check_no_hardcoded_secret(config) -> Iterator[Violation]:
     for where, key, value in _walk_config(config, ""):
         if key in SECRET_KEY_ALLOWLIST or not isinstance(value, str) or not value:
             continue
         if SECRET_KEY_PATTERN.search(key):
-            violations.append(Violation(
-                "R12", where, "giá trị bí mật nằm trong config — phải đến từ env/Vault"))
-    return violations
+            yield Violation(
+                "R12", where, "giá trị bí mật nằm trong config — phải đến từ env/Vault")
 
 
 RULES = (
@@ -254,11 +226,7 @@ RULES = (
 
 
 def lint(config: dict[str, Any]) -> list[Violation]:
-    violations = []
-    for rule in RULES:
-        violations.extend(rule(config))
-
-    return violations
+    return [violation for rule in RULES for violation in rule(config)]
 
 
 def main(argv: list[str]) -> int:
