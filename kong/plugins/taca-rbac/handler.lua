@@ -10,10 +10,9 @@ local TacaRbacHandler = {
   VERSION = "1.0.0",
 }
 
+-- Ngữ nghĩa any-of: yêu cầu rỗng nghĩa là không gate theo tiêu chí đó.
 local function has_any(granted, required)
-  if #required == 0 then
-    return true
-  end
+  if #required == 0 then return true end
 
   local granted_set = {}
   for _, value in ipairs(granted or {}) do
@@ -21,22 +20,14 @@ local function has_any(granted, required)
   end
 
   for _, value in ipairs(required) do
-    if granted_set[value] then
-      return true
-    end
+    if granted_set[value] then return true end
   end
 
   return false
 end
 
-local function has_requirements(config)
-  return #config.required_roles > 0 or #config.required_any_permission > 0
-end
-
 function TacaRbacHandler:access(config)
-  if not has_requirements(config) then
-    return
-  end
+  if #config.required_roles == 0 and #config.required_any_permission == 0 then return end
 
   local actor = kong.ctx.shared.taca_actor
   if not actor then
@@ -46,11 +37,8 @@ function TacaRbacHandler:access(config)
     return envelope_builder.exit("GATEWAY_PERMISSION_DENIED")
   end
 
-  if not has_any(actor.roles, config.required_roles) then
-    return envelope_builder.exit("GATEWAY_PERMISSION_DENIED")
-  end
-
-  if not has_any(actor.permissions, config.required_any_permission) then
+  if not has_any(actor.roles, config.required_roles)
+     or not has_any(actor.permissions, config.required_any_permission) then
     return envelope_builder.exit("GATEWAY_PERMISSION_DENIED")
   end
 end
