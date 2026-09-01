@@ -6,31 +6,26 @@ local cjson = require "cjson.safe"
 local error_catalog = require "kong.plugins.taca-lib.error_catalog"
 
 local REQUEST_ID_HEADER = "X-Request-ID"
-local JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 
 local _M = {}
+
+-- Cùng một Content-Type cho mọi body do Gateway tự sinh, khai báo ở đây để ba plugin
+-- viết lại body không trôi mỗi nơi một giá trị.
+_M.JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 
 -- trace_id lấy từ X-Request-ID do plugin correlation-id sinh ở đầu chuỗi access.
 -- Khi không có route nào khớp, chuỗi access không chạy nên không có header nào cả;
 -- lúc đó dùng request id của chính Kong — cùng giá trị Kong ghi vào error log, nên
 -- vẫn tra ngược được. Contract yêu cầu mọi response lỗi đều có trace_id (API §1.2).
 function _M.resolve_trace_id()
-  local ctx_trace_id = kong.ctx.shared.taca_trace_id
-  if ctx_trace_id then
-    return ctx_trace_id
-  end
-
-  local client_value = kong.request.get_header(REQUEST_ID_HEADER)
-  if client_value then
-    return client_value
+  local known = kong.ctx.shared.taca_trace_id or kong.request.get_header(REQUEST_ID_HEADER)
+  if known then
+    return known
   end
 
   local loaded, request_id = pcall(require, "kong.observability.tracing.request_id")
-  if loaded then
-    return request_id.get() or ""
-  end
 
-  return ""
+  return loaded and request_id.get() or ""
 end
 
 function _M.build(code, details, trace_id)
@@ -51,12 +46,10 @@ end
 -- ở header_filter/body_filter phải sửa body tại chỗ vì response đã bắt đầu gửi.
 function _M.exit(code, details, extra_headers)
   local body, status = _M.build(code, details)
+  local headers = { ["Content-Type"] = _M.JSON_CONTENT_TYPE }
 
-  local headers = { ["Content-Type"] = JSON_CONTENT_TYPE }
-  if extra_headers then
-    for name, value in pairs(extra_headers) do
-      headers[name] = value
-    end
+  for name, value in pairs(extra_headers or {}) do
+    headers[name] = value
   end
 
   return kong.response.exit(status, body, headers)

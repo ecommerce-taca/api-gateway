@@ -31,6 +31,8 @@ RedisClient.__index = RedisClient
 
 local _M = {}
 
+-- options nhận thẳng block `redis` trong schema của plugin: ba plugin khai báo giống
+-- hệt nhau nên không cần hàm map riêng ở từng handler.
 function _M.new(options)
   return setmetatable({
     host = options.host,
@@ -48,92 +50,75 @@ function RedisClient:_acquire()
   -- Mọi lời gọi ra ngoài phải có timeout; thiếu nó thì Redis chậm sẽ kéo cả gateway treo.
   connection:set_timeouts(self.timeout_ms, self.timeout_ms, self.timeout_ms)
 
-  local connected, err = connection:connect(self.host, self.port)
-  if not connected then
+  local ok, err = connection:connect(self.host, self.port)
+  if ok and self.password then
+    ok, err = connection:auth(self.password)
+  end
+
+  if ok and self.database ~= 0 then
+    ok, err = connection:select(self.database)
+  end
+
+  if not ok then
     return nil, REDIS_UNAVAILABLE, err
-  end
-
-  if self.password then
-    local authorized, auth_err = connection:auth(self.password)
-    if not authorized then
-      return nil, REDIS_UNAVAILABLE, auth_err
-    end
-  end
-
-  if self.database ~= 0 then
-    local selected, select_err = connection:select(self.database)
-    if not selected then
-      return nil, REDIS_UNAVAILABLE, select_err
-    end
   end
 
   return connection
 end
 
-function RedisClient:_release(connection)
-  -- Trả connection về pool thay vì đóng: handshake TCP cho mỗi request là chi phí vô ích
-  -- trên đường đi nóng của mọi request có rate limit.
-  local kept = connection:set_keepalive(self.keepalive_idle_timeout_ms, self.keepalive_pool_size)
-  if not kept then
-    connection:close()
-  end
-end
-
-function RedisClient:_run(script, key, argument)
+-- Một đường vào duy nhất cho mọi lệnh: acquire → chạy → trả connection về pool thay vì
+-- đóng, vì handshake TCP mỗi request là chi phí vô ích trên đường đi nóng.
+function RedisClient:_call(command)
   local connection, code, err = self:_acquire()
   if not connection then
     return nil, code, err
   end
 
-  local value, eval_err = connection:eval(script, 1, key, argument)
+  local value, command_err = command(connection)
   if not value then
     connection:close()
-    return nil, REDIS_UNAVAILABLE, eval_err
+    return nil, REDIS_UNAVAILABLE, command_err
   end
 
-  self:_release(connection)
+  if not connection:set_keepalive(self.keepalive_idle_timeout_ms, self.keepalive_pool_size) then
+    connection:close()
+  end
 
   return value
 end
 
 function RedisClient:increment_with_expiry(key, ttl_seconds)
-  return self:_run(INCREMENT_SCRIPT, key, ttl_seconds)
+  return self:_call(function(connection)
+    return connection:eval(INCREMENT_SCRIPT, 1, key, ttl_seconds)
+  end)
 end
 
 function RedisClient:decrement(key)
-  return self:_run(DECREMENT_SCRIPT, key, 0)
+  return self:_call(function(connection)
+    return connection:eval(DECREMENT_SCRIPT, 1, key, 0)
+  end)
 end
 
 function RedisClient:key_exists(key)
-  local connection, code, err = self:_acquire()
-  if not connection then
+  -- EXISTS trả 0 khi vắng mặt: 0 vẫn là giá trị hợp lệ nên chỉ nil mới là lỗi.
+  local exists, code, err = self:_call(function(connection)
+    return connection:exists(key)
+  end)
+  if exists == nil then
     return nil, code, err
   end
 
-  local value, exists_err = connection:exists(key)
-  if not value then
-    connection:close()
-    return nil, REDIS_UNAVAILABLE, exists_err
-  end
-
-  self:_release(connection)
-
-  return value == 1
+  return exists == 1
 end
 
 function RedisClient:ping()
-  local connection, code, err = self:_acquire()
-  if not connection then
+  local pong, code, err = self:_call(function(connection)
+    return connection:ping()
+  end)
+
+  if not pong then
     return nil, code, err
   end
-
-  local pong, ping_err = connection:ping()
-  if not pong then
-    connection:close()
-    return nil, REDIS_UNAVAILABLE, ping_err
-  end
-
-  self:_release(connection)
 
   return true
 end
