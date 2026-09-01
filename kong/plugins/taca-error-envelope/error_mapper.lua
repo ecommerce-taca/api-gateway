@@ -29,34 +29,33 @@ local UPSTREAM_5XX_CODES = {
   [504] = "GATEWAY_UPSTREAM_TIMEOUT",
 }
 
+local function replace(code, status)
+  return { action = _M.actions.REPLACE, code = code, status = status }
+end
+
 local function gateway_origin_plan(config, status, access_phase_reached)
   -- Kong raise Lua error trần khi Redis của rate-limiting hỏng, nên request chết giữa
   -- phase access và plugin này (PRIORITY thấp nhất) không kịp chạy access. Thiếu dấu
   -- access trên route có rate limit Redis là dấu hiệu đủ mạnh để trả đúng mã Redis.
   if status == 500 and config.redis_backed_rate_limit and not access_phase_reached then
-    return { action = _M.actions.REPLACE, code = "GATEWAY_REDIS_UNAVAILABLE", status = 503 }
+    return replace("GATEWAY_REDIS_UNAVAILABLE", 503)
   end
 
   local code = GATEWAY_ORIGIN_CODES[status]
-  if code then
-    return { action = _M.actions.REPLACE, code = code, status = status }
-  end
+  if code then return replace(code, status) end
 
   -- Các status còn lại của nginx (405, 408, 411, 414, 494→400...) không có mã riêng
   -- trong contract; giữ nguyên status và dùng mã định dạng request sai.
-  if status < 500 then
-    return { action = _M.actions.REPLACE, code = "GATEWAY_INVALID_REQUEST", status = status }
-  end
+  if status < 500 then return replace("GATEWAY_INVALID_REQUEST", status) end
 
-  return { action = _M.actions.REPLACE, code = "GATEWAY_INTERNAL_ERROR", status = status }
+  return replace("GATEWAY_INTERNAL_ERROR", status)
 end
 
 local function upstream_plan(status)
   if status >= 500 then
-    local code = UPSTREAM_5XX_CODES[status] or "GATEWAY_UPSTREAM_BAD_RESPONSE"
-    local mapped_status = UPSTREAM_5XX_CODES[status] and status or 502
+    local code = UPSTREAM_5XX_CODES[status]
 
-    return { action = _M.actions.REPLACE, code = code, status = mapped_status }
+    return replace(code or "GATEWAY_UPSTREAM_BAD_RESPONSE", code and status or 502)
   end
 
   -- 4xx của service: giữ status thật và giữ business code nếu body hợp lệ.
@@ -66,9 +65,7 @@ end
 -- source: giá trị của kong.response.get_source() — "exit"/"error" là lỗi do Kong/plugin
 -- sinh, "service" là response thật của upstream.
 function _M.plan(config, source, status, access_phase_reached)
-  if source == "service" then
-    return upstream_plan(status)
-  end
+  if source == "service" then return upstream_plan(status) end
 
   return gateway_origin_plan(config, status, access_phase_reached)
 end
