@@ -96,12 +96,35 @@ plugins:
       path: /dev/stdout
       reopen: false
       custom_fields_by_lua:
-        # Trả về nil để xoá hẳn field khỏi bản ghi log.
+        # Trả về nil để xoá hẳn field khỏi bản ghi log. Key chỉ được tách theo DẤU CHẤM
+        # (kong/pdk/log.lua `edit_result`) — cú pháp ngoặc không có tác dụng, mà tên header
+        # có gạch ngang vẫn viết thẳng sau dấu chấm được.
         request.headers.authorization: "return nil"
         request.headers.cookie: "return nil"
-        request.headers[\"sec-websocket-protocol\"]: "return nil"
-        response.headers[\"set-cookie\"]: "return nil"
-        request.url: "local url = kong.request.get_path_with_query() return (url:gsub('access_token=[^&]*', 'access_token=[REDACTED]'))"
+        request.headers.sec-websocket-protocol: "return nil"
+        response.headers.set-cookie: "return nil"
+        # Token qua query (API §3.12) xuất hiện ở cả bốn field mà serializer của Kong sinh
+        # ra từ một request: uri, url, querystring, upstream_uri. Bỏ sót field nào thì
+        # SEC-GW-08/12 vẫn hỏng, nên giữ đúng một field URL đã redact và bỏ ba field còn lại.
+        request.url: "return nil"
+        upstream_uri: "return nil"
+        request.uri: |-
+          local uri = kong.request.get_path_with_query()
+          for _, name in ipairs({ 'access_token', 'refresh_token', 'token', 'password', 'otp', 'code' }) do
+            uri = uri:gsub('([?&]' .. name .. '=)[^&]*', '%1[REDACTED]')
+          end
+          return uri
+        # Giữ tên tham số để vẫn debug được đường đi, chỉ thay giá trị nhạy cảm.
+        # Phải dựng bảng MỚI: trả về chính bảng của get_query() thì Kong không ghi đè
+        # field (đã thử trên stack thật — sửa tại chỗ không có tác dụng).
+        request.querystring: |-
+          local sensitive = { access_token = true, refresh_token = true, token = true,
+                              password = true, otp = true, code = true }
+          local safe = {}
+          for name, value in pairs(kong.request.get_query()) do
+            safe[name] = sensitive[name] and '[REDACTED]' or value
+          end
+          return safe
 
 # ---------------------------------------------------------------------------
 # Upstream — mỗi domain service một upstream, target lấy từ biến môi trường

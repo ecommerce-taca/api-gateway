@@ -35,6 +35,11 @@ FROM kong:${KONG_VERSION} AS runtime
 USER root
 COPY --chown=kong:kong kong/plugins /usr/local/custom/kong/plugins
 COPY --chown=kong:kong kong/kong.conf /etc/kong/kong.conf
+# HEALTHCHECK cần curl để probe status listener (:8100); image Kong base (Ubuntu 24.04)
+# không có curl. --no-install-recommends để không kéo thêm bloat vào image runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 USER kong
 
 # Nhắc lại danh sách plugin ở ENV để `docker run` không kèm kong.conf vẫn nạp đủ plugin.
